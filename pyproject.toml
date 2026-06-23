@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "llamification"
+version = "0.1.0"
+description = "Lightweight Ollama-compatible proxy for online LLM providers"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "LLamification", email = "user@example.com"},
+]
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt6>=6.5",
+    "aiohttp>=3.9",
+]
+
+[project.scripts]
+llamification = "llamification.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["llamification*"]
