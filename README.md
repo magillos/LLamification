@@ -22,7 +22,7 @@ cd LLamification
 # Install dependencies (pick one)
 
 # Option A: Use your distro's package manager
-#   Debian/Ubuntu: sudo apt install python3-pyqt6 python3-aiohttp
+#   Debian/Ubuntu: sudo apt install python3-pyqt6 python3-aiohttp python3-pyqt6.qtsvg
 #   Fedora:        sudo dnf install python3-qt6 python3-aiohttp
 #   Arch:          sudo pacman -S python-pyqt6 python-aiohttp
 
