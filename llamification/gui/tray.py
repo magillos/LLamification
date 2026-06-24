@@ -20,7 +20,7 @@ def create_tray_icon(parent, main_window) -> QSystemTrayIcon:
     """
     tray = QSystemTrayIcon(parent)
 
-    # Create a simple icon programmatically (a colored circle)
+    # Load the LLamification SVG icon
     icon = _make_icon()
     tray.setIcon(icon)
     tray.setToolTip("LLamification — Ollama-compatible proxy")
@@ -61,17 +61,23 @@ def create_tray_icon(parent, main_window) -> QSystemTrayIcon:
 
 
 def _make_icon() -> QIcon:
-    """Create a simple colored circle icon."""
+    """Load the LLamification SVG icon."""
+    from pathlib import Path
+
+    from PyQt6.QtGui import QPainter
+    from PyQt6.QtSvg import QSvgRenderer
+
+    svg_path = Path(__file__).parent / "LLamification.svg"
+    renderer = QSvgRenderer(str(svg_path))
+
     pixmap = QPixmap(64, 64)
     pixmap.fill(Qt.GlobalColor.transparent)
-    from PyQt6.QtGui import QPainter, QColor, QBrush
 
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setBrush(QBrush(QColor("#4a90d9")))
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.drawEllipse(4, 4, 56, 56)
+    renderer.render(painter)
     painter.end()
+
     return QIcon(pixmap)
 
 
