@@ -9,7 +9,7 @@ description = "Lightweight Ollama-compatible proxy for online LLM providers"
 readme = "README.md"
 license = "MIT"
 authors = [
-    {name = "LLamification", email = "kerown gmail com"},
+    {name = "Magillos", email = "kerown@gmail.com"},
 ]
 requires-python = ">=3.10"
 dependencies = [
