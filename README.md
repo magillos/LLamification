@@ -13,6 +13,8 @@ I wanted something simpler than litellm for my use case: connecting online LLMs 
 ## Quick start
 
 ```bash
+#For Arch Linux users, app is available on AUR
+
 # Clone the repository
 git clone https://github.com/magillos/LLamification.git
 cd LLamification
