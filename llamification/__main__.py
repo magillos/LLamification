@@ -66,7 +66,10 @@ def _run_gui():
     """Launch the LLamification GUI application."""
     import signal as _signal
 
+    from pathlib import Path
+
     from PyQt6.QtCore import QTimer
+    from PyQt6.QtGui import QIcon
     from PyQt6.QtWidgets import QApplication
 
     from .gui.main_window import MainWindow
@@ -77,6 +80,10 @@ def _run_gui():
     app = QApplication(sys.argv)
     app.setApplicationName("LLamification")
     app.setOrganizationName("LLamification")
+
+    # Set window icon from the bundled SVG icon
+    icon_path = str(Path(__file__).resolve().parent / "gui" / "LLamification.svg")
+    app.setWindowIcon(QIcon(icon_path))
 
     window = MainWindow()
     window.show()

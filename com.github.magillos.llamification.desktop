@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=LLamification
+Comment=Ollama-compatible proxy for online LLM providers
+Exec=llamification -g
+Icon=com.github.magillos.llamification
+Terminal=false
+Categories=Network;Development;
+StartupNotify=true
