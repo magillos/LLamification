@@ -7,7 +7,7 @@ name = "llamification"
 version = "0.1.0"
 description = "Lightweight Ollama-compatible proxy for online LLM providers"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "LLamification", email = "kerown gmail com"},
 ]
