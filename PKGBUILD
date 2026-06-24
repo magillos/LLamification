@@ -3,7 +3,7 @@
 
 pkgname=llamification-git
 _pkgname=llamification
-pkgver=0e200d2
+pkgver=8dca5b1
 pkgrel=1
 pkgdesc="Lightweight Ollama-compatible proxy for online LLM providers (git)"
 arch=('any')
