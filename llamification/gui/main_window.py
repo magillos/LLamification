@@ -597,6 +597,11 @@ class MainWindow(QMainWindow):
             self._refresh_custom_url_ui()
             return
 
+        # Save the outgoing provider's model under its own key **before**
+        # switching to the new provider, so the stale model does not leak into
+        # the new provider's config entry.
+        self._save_current_model_for_provider(self._last_provider_key)
+
         cfg = load_config()
         cp = cfg.setdefault("custom_providers", {})
         cp_id = new_custom_id(cp)
@@ -909,7 +914,10 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 self.model_combo.setCurrentIndex(idx)
             else:
-                self.model_combo.setCurrentText(current)
+                # The saved model doesn't exist in the fetched list (e.g. a
+                # stale model from a different provider leaked in). Clear the
+                # combo text so no model is shown as selected.
+                self.model_combo.setCurrentIndex(-1)
         self.model_combo.blockSignals(False)
 
         self._models_cache = model_ids
