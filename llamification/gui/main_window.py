@@ -1011,7 +1011,7 @@ class MainWindow(QMainWindow):
         self.log_signal.emit(f"  Serving model '{model}' via {display}")
         # Update tray toggle action
         if hasattr(self, "_tray_toggle_action"):
-            self._tray_toggle_action.setText("Stop Server")
+            self._tray_toggle_action.setText("Stop Proxy")
 
     def _run_server_loop(self, loop: asyncio.AbstractEventLoop, server: ProxyServer):
         """Run the asyncio event loop with the proxy server."""
@@ -1063,7 +1063,7 @@ class MainWindow(QMainWindow):
         self.log_signal.emit("■ Proxy stopped.")
         # Update tray toggle action
         if hasattr(self, "_tray_toggle_action"):
-            self._tray_toggle_action.setText("Start Server")
+            self._tray_toggle_action.setText("Start Proxy")
 
     def update_active_model(self, model: str):
         """Update the active model on-the-fly (called from tray or combo)."""

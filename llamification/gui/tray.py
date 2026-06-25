@@ -15,7 +15,7 @@ def create_tray_icon(parent, main_window) -> QSystemTrayIcon:
     
     The parent is the MainWindow. The tray provides:
       - Show window
-      - Stop/Start server
+      - Stop/Start proxy
       - Quit
     """
     tray = QSystemTrayIcon(parent)
@@ -34,8 +34,8 @@ def create_tray_icon(parent, main_window) -> QSystemTrayIcon:
 
     menu.addSeparator()
 
-    # Server toggle
-    main_window._tray_toggle_action = QAction("Stop Server", parent)
+    # Proxy toggle
+    main_window._tray_toggle_action = QAction("Start Proxy", parent)
     main_window._tray_toggle_action.triggered.connect(lambda: _toggle_server(main_window))
     menu.addAction(main_window._tray_toggle_action)
 
@@ -97,13 +97,13 @@ def _show_window(main_window):
 
 
 def _toggle_server(main_window):
-    """Toggle server on/off from tray menu."""
+    """Toggle proxy on/off from tray menu."""
     if main_window._server is not None:
         main_window._stop_server()
-        main_window._tray_toggle_action.setText("Start Server")
+        main_window._tray_toggle_action.setText("Start Proxy")
     else:
         main_window._start_server()
-        main_window._tray_toggle_action.setText("Stop Server")
+        main_window._tray_toggle_action.setText("Stop Proxy")
 
 
 def _quit_app(parent, main_window):
