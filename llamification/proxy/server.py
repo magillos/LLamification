@@ -396,10 +396,11 @@ class ProxyServer:
 
         payload = self._provider.prepare_chat_payload(model, messages, False, options)
         headers = {
-            "Authorization": f"Bearer {self._provider.api_key}",
             "Content-Type": "application/json",
             "User-Agent": "LLamification/0.1",
         }
+        if self._provider.api_key:
+            headers["Authorization"] = f"Bearer {self._provider.api_key}"
 
         url = self._provider.api_base()
         logger.info(f"POST {url}")
@@ -427,11 +428,12 @@ class ProxyServer:
 
         payload = self._provider.prepare_chat_payload(model, messages, True, options)
         headers = {
-            "Authorization": f"Bearer {self._provider.api_key}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
             "User-Agent": "LLamification/0.1",
         }
+        if self._provider.api_key:
+            headers["Authorization"] = f"Bearer {self._provider.api_key}"
 
         url = self._provider.api_base()
         logger.info(f"Stream POST {url}")

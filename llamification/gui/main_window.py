@@ -468,7 +468,7 @@ class MainWindow(QMainWindow):
         url_edit.setPlaceholderText("https://your-provider.com/v1")
         key_edit = QLineEdit(initial_key)
         key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        key_edit.setPlaceholderText("Enter your API key...")
+        key_edit.setPlaceholderText("Optional — leave blank for local/no-auth providers")
         form.addRow("Name:", name_edit)
         form.addRow("Base URL:", url_edit)
         form.addRow("API Key:", key_edit)
@@ -857,12 +857,6 @@ class MainWindow(QMainWindow):
 
         api_key = self._current_api_key()
 
-        if not api_key:
-            self.log_signal.emit("⚠ API key is required to fetch models.")
-            self.refresh_btn.setEnabled(True)
-            self.refresh_btn.setText("⟳ Refresh Models")
-            return
-
         base_url = ""
         if is_custom_provider(provider_key):
             base_url = self.custom_url_edit.text().strip()
@@ -943,9 +937,6 @@ class MainWindow(QMainWindow):
     def _start_server(self):
         """Start the proxy server in a background thread."""
         api_key = self._current_api_key()
-        if not api_key:
-            self.log_signal.emit("⚠ API key is required.")
-            return
 
         provider_key = self.provider_combo.currentData()
         if provider_key == ADD_CUSTOM_KEY:

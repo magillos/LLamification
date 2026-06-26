@@ -43,10 +43,9 @@ class LLMProvider(ABC):
 
     async def fetch_models(self) -> List[Dict[str, str]]:
         """Fetch available models from the provider."""
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Accept": "application/json",
-        }
+        headers = {"Accept": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(self.model_list_url(), timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status != 200:
