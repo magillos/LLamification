@@ -36,11 +36,20 @@ def parse_ollama_generate_request(body: dict) -> tuple:
 
 
 def parse_ollama_chat_request(body: dict) -> tuple:
-    """Parse an Ollama /api/chat request into (model, messages, stream, options)."""
+    """Parse an Ollama /api/chat request into (model, messages, stream, options).
+
+    Also extracts Ollama-style ``tools`` and ``tool_choice`` from the request
+    body so they can be forwarded to the upstream OpenAI-compatible provider.
+    """
     model = body.get("model", "default")
     messages = body.get("messages", [])
     stream = body.get("stream", False)
     options = body.get("options", {})
+    # Ollama puts tools at the top level of the request body, not inside options.
+    if "tools" in body:
+        options["tools"] = body["tools"]
+    if "tool_choice" in body:
+        options["tool_choice"] = body["tool_choice"]
     return model, messages, stream, options
 
 
@@ -91,18 +100,31 @@ def make_ollama_generate_response(provider_response: dict) -> dict:
 
 
 def make_ollama_chat_response(provider_response: dict) -> dict:
-    """Convert a non-streaming provider chat response to Ollama /api/chat format."""
+    """Convert a non-streaming provider chat response to Ollama /api/chat format.
+
+    Also translates OpenAI-style ``tool_calls`` into Ollama's
+    ``message.tool_calls`` format so Ollama-native clients can use tools.
+    """
     content = ""
+    tool_calls = None
+    done_reason = "stop"
     try:
-        content = provider_response["choices"][0]["message"]["content"]
+        msg = provider_response["choices"][0]["message"]
+        content = msg.get("content", "") or ""
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            done_reason = "stop"
     except (KeyError, IndexError):
         pass
+    message: Dict[str, Any] = {"role": "assistant", "content": content}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     return {
         "model": provider_response.get("model", "unknown"),
         "created_at": "2024-01-01T00:00:00Z",
-        "message": {"role": "assistant", "content": content},
+        "message": message,
         "done": True,
-        "done_reason": "stop",
+        "done_reason": done_reason,
         "total_duration": 0,
         "load_duration": 0,
         "prompt_eval_count": 0,

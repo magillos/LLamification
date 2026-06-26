@@ -97,6 +97,16 @@ class OpenAICompatibleProvider(LLMProvider):
             payload["tools"] = options["tools"]
         if "tool_choice" in options:
             payload["tool_choice"] = options["tool_choice"]
+        # Forward structured-output / JSON-mode requests.
+        if "response_format" in options:
+            payload["response_format"] = options["response_format"]
+        # Forward stream options (e.g. include_usage for token counting).
+        if "stream_options" in options:
+            payload["stream_options"] = options["stream_options"]
+        # Forward additional sampling parameters that agentic clients may set.
+        for key in ("presence_penalty", "frequency_penalty", "seed", "n"):
+            if key in options:
+                payload[key] = options[key]
         return payload
 
     def _parse_models(self, data: dict) -> List[Dict[str, str]]:

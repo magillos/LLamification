@@ -26,7 +26,6 @@ logger = logging.getLogger("llamification.proxy")
 async def cors_middleware(request: web.Request, handler) -> web.StreamResponse:
     """Add CORS headers to all responses and handle OPTIONS preflight."""
     if request.method == "OPTIONS":
-        # Respond to CORS preflight with the requested origin echoed back
         origin = request.headers.get("Origin", "*")
         req_headers = request.headers.get("Access-Control-Request-Headers", "content-type, authorization")
         return web.Response(
@@ -57,7 +56,7 @@ class ProxyServer:
       GET  /                  -> "Ollama is running"
       GET  /api/tags          -> list available models
       POST /api/generate      -> generate text
-      POST /api/chat          -> chat completion
+      POST /api/chat          -> chat completion (with tools support)
       POST /api/embeddings    -> embeddings (proxied to upstream)
 
     OpenAI-compatible routes:
@@ -73,102 +72,72 @@ class ProxyServer:
         self._models: List[str] = []
         self._active_model: str = ""
         self._allow_client_override: bool = True
-        self._model_aliases: Dict[str, str] = {}  # alias -> full_model_id
+        self._model_aliases: Dict[str, str] = {}
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
 
         self.app = web.Application(middlewares=[cors_middleware])
 
-        # Ollama endpoints
         self.app.router.add_get("/", self.handle_root)
         self.app.router.add_get("/api/tags", self.handle_tags)
         self.app.router.add_post("/api/generate", self.handle_generate)
         self.app.router.add_post("/api/chat", self.handle_chat)
         self.app.router.add_post("/api/embeddings", self.handle_v1_embeddings)
 
-        # OpenAI-compatible endpoints
-        self.app.router.add_get("/v1", self.handle_v1_root)  # some apps check this
+        self.app.router.add_get("/v1", self.handle_v1_root)
         self.app.router.add_get("/v1/models", self.handle_v1_models)
         self.app.router.add_post("/v1/chat/completions", self.handle_v1_chat)
         self.app.router.add_post("/v1/embeddings", self.handle_v1_embeddings)
 
     def configure(self, provider: LLMProvider, models: List[str], active_model: str, allow_client_override: bool = True):
-        """Set the current provider, available models, active model, and override setting."""
         self._provider = provider
         self._models = models
         self._active_model = active_model
         self._allow_client_override = allow_client_override
-        
-        # Auto-generate aliases: extract short name from full model ID
-        # e.g., "z-ai/glm-5.1" -> alias "glm-5.1"
         self._model_aliases = {}
         for model in models:
             if "/" in model:
-                short_name = model.split("/", 1)[1]  # Get part after "/"
+                short_name = model.split("/", 1)[1]
                 self._model_aliases[short_name] = model
-        
-        # Also add the active model's short name if it has one
         if active_model and "/" in active_model:
             short_name = active_model.split("/", 1)[1]
             self._model_aliases[short_name] = active_model
 
     def get_active_model(self) -> str:
-        """Return the currently active model name."""
         return self._active_model
-    
+
     def _resolve_model_alias(self, model: str) -> str:
-        """Resolve a model alias to its full ID, or return the model as-is."""
-        # If the model is in our aliases, return the full ID
         if model in self._model_aliases:
             resolved = self._model_aliases[model]
             logger.info(f"Model alias resolved: '{model}' -> '{resolved}'")
             return resolved
-        # Otherwise return as-is (could be full ID already, or "default")
         return model
 
     async def handle_root(self, request: web.Request) -> web.Response:
-        return web.json_response(
-            {"status": "Ollama is running"},
-            status=200,
-        )
+        return web.json_response({"status": "Ollama is running"}, status=200)
 
     async def handle_tags(self, request: web.Request) -> web.Response:
         if not self._models:
             return web.json_response({"models": []}, status=200)
-        
         if self._allow_client_override:
             models_to_return = self._models
         else:
             models_to_return = [self._active_model] if self._active_model else [self._models[0]]
-
         provider_name = "llamification"
         if self._provider:
             provider_name = type(self._provider).__name__.replace("Provider", "").lower()
-        return web.json_response(
-            make_ollama_tags_response(models_to_return, provider_name),
-            status=200,
-        )
+        return web.json_response(make_ollama_tags_response(models_to_return, provider_name), status=200)
 
     async def handle_v1_root(self, request: web.Request) -> web.Response:
-        """OpenAI-compatible GET /v1 — some apps check this as a health endpoint."""
-        return web.json_response(
-            {"status": "running", "provider": "llamification"},
-            status=200,
-        )
+        return web.json_response({"status": "running", "provider": "llamification"}, status=200)
 
     async def handle_v1_models(self, request: web.Request) -> web.Response:
-        """OpenAI-compatible GET /v1/models."""
         if self._allow_client_override:
             models_list = self._models or [self._active_model] if self._active_model else []
         else:
             models_list = [self._active_model] if self._active_model else []
         data = [
-            {
-                "id": m,
-                "object": "model",
-                "created": 1700000000,
-                "owned_by": "llamification",
-            }
+            {"id": m, "object": "model", "created": 1700000000, "owned_by": "llamification"}
             for m in models_list
         ]
         return web.json_response({"object": "list", "data": data}, status=200)
@@ -189,62 +158,70 @@ class ProxyServer:
         }
         if "stop" in body:
             options["stop"] = body["stop"]
-        # Pass through function-calling fields so agentic clients (Cline,
-        # Continue, Roo Code, etc.) can use tools through the proxy.
-        # These are only present when the client explicitly requests them,
-        # so plain chat requests are unaffected.
         if "tools" in body:
             options["tools"] = body["tools"]
         if "tool_choice" in body:
             options["tool_choice"] = body["tool_choice"]
+        if "response_format" in body:
+            options["response_format"] = body["response_format"]
+        if "stream_options" in body:
+            options["stream_options"] = body["stream_options"]
+        for key in ("presence_penalty", "frequency_penalty", "seed", "n"):
+            if key in body:
+                options[key] = body[key]
 
         if not self._provider:
             return web.json_response({"error": "No provider configured"}, status=503)
 
-        # Resolve model: check aliases, fall back to active model if "default"
         if model == "default":
             actual_model = self._active_model or "default"
         else:
             actual_model = self._resolve_model_alias(model)
-        
+
         provider_model = self._provider.model_param(actual_model)
 
         if stream:
-            # Build CORS headers for streaming response
             origin = request.headers.get("Origin", "*")
-            cors = {
-                "Access-Control-Allow-Origin": origin,
-                "Access-Control-Allow-Credentials": "true",
-            }
             response = web.StreamResponse(
                 status=200,
                 headers={
                     "Content-Type": "text/event-stream",
                     "Cache-Control": "no-cache",
-                    **cors,
+                    "Access-Control-Allow-Origin": origin,
+                    "Access-Control-Allow-Credentials": "true",
                 },
             )
             await response.prepare(request)
 
+            stream_opts = body.get("stream_options", {})
+            include_usage = (
+                stream_opts.get("include_usage", False) if isinstance(stream_opts, dict) else False
+            )
+
             try:
-                async for token, done, tool_delta in self._stream_chat(provider_model, messages, options):
+                async for token, done, tool_delta, usage in self._stream_chat(
+                    provider_model, messages, options
+                ):
                     if done:
                         chunk_data = {
-                            "choices": [{"delta": {}, "finish_reason": "stop", "index": 0}],
+                            "choices": [{"delta": {}, "finish_reason": "stop", "index": 0}]
                         }
                     elif tool_delta is not None:
-                        # Forward tool-call deltas from the upstream so agentic
-                        # clients receive incremental function-call arguments.
                         chunk_data = {
-                            "choices": [{"delta": {"tool_calls": [tool_delta]}, "index": 0}],
+                            "choices": [{"delta": {"tool_calls": [tool_delta]}, "index": 0}]
                         }
                     else:
                         chunk_data = {
-                            "choices": [{"delta": {"content": token}, "index": 0}],
+                            "choices": [{"delta": {"content": token}, "index": 0}]
                         }
                     line = f"data: {json.dumps(chunk_data)}\n\n"
                     await response.write(line.encode("utf-8"))
                     if done:
+                        if include_usage and usage:
+                            usage_chunk = {"choices": [], "usage": usage}
+                            await response.write(
+                                f"data: {json.dumps(usage_chunk)}\n\n".encode("utf-8")
+                            )
                         break
                 await response.write(b"data: [DONE]\n\n")
             except (ConnectionError, asyncio.CancelledError) as e:
@@ -264,7 +241,6 @@ class ProxyServer:
         else:
             try:
                 provider_resp = await self._non_stream_chat(provider_model, messages, options)
-                # Return in OpenAI format
                 content = ""
                 tool_calls = None
                 finish_reason = "stop"
@@ -300,39 +276,22 @@ class ProxyServer:
             except Exception as e:
                 logger.error(f"V1 chat error: {e}")
                 return web.json_response({"error": str(e)}, status=502)
-
     async def handle_v1_embeddings(self, request: web.Request) -> web.Response:
-        """OpenAI-compatible POST /v1/embeddings (also serves /api/embeddings).
-
-        Proxies the request body to the upstream provider's ``/embeddings``
-        endpoint and returns its response unchanged.
-        """
         if not self._provider:
             return web.json_response({"error": "No provider configured"}, status=503)
         body = await request.json()
         url = f"{self._provider.base_url}/embeddings"
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "LLamification/0.1",
-        }
+        headers = {"Content-Type": "application/json", "User-Agent": "LLamification/0.1"}
         if self._provider.api_key:
             headers["Authorization"] = f"Bearer {self._provider.api_key}"
         logger.info(f"Embeddings POST {url}")
         connector = aiohttp.TCPConnector(force_close=True)
         try:
             async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
-                async with session.post(
-                    url,
-                    json=body,
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as resp:
+                async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=120)) as resp:
                     if resp.status != 200:
                         err_text = await resp.text()
-                        logger.error(f"Embeddings {resp.status} from {url}: {err_text[:500]}")
-                        return web.json_response(
-                            {"error": f"Provider returned {resp.status}: {err_text}"},
-                            status=502,
-                        )
+                        return web.json_response({"error": f"Provider returned {resp.status}: {err_text}"}, status=502)
                     data = await resp.json()
                     return web.json_response(data, status=200)
         except Exception as e:
@@ -342,35 +301,20 @@ class ProxyServer:
     async def handle_generate(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         model, prompt, messages, stream, options = parse_ollama_generate_request(body)
-        
         if not self._allow_client_override:
             model = self._active_model or "default"
-
         if not self._provider:
-            return web.json_response(
-                {"error": "No provider configured"}, status=503
-            )
-
-        # Resolve model: check aliases, fall back to active model if "default"
+            return web.json_response({"error": "No provider configured"}, status=503)
         if model == "default":
             actual_model = self._active_model or "default"
         else:
             actual_model = self._resolve_model_alias(model)
-        
         provider_model = self._provider.model_param(actual_model)
-
         if stream:
-            response = web.StreamResponse(
-                status=200,
-                headers={
-                    "Content-Type": "application/x-ndjson",
-                    "Cache-Control": "no-cache",
-                },
-            )
+            response = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson", "Cache-Control": "no-cache"})
             await response.prepare(request)
-
             try:
-                async for token, done, _ in self._stream_chat(provider_model, messages, options):
+                async for token, done, _, _ in self._stream_chat(provider_model, messages, options):
                     chunk = make_ollama_stream_chunk(token, done)
                     await response.write(chunk.encode("utf-8"))
                     if done:
@@ -382,7 +326,6 @@ class ProxyServer:
                     await response.write(err_chunk.encode("utf-8"))
                 except Exception:
                     pass
-
             try:
                 await response.write_eof()
             except Exception:
@@ -400,35 +343,20 @@ class ProxyServer:
     async def handle_chat(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         model, messages, stream, options = parse_ollama_chat_request(body)
-        
         if not self._allow_client_override:
             model = self._active_model or "default"
-
         if not self._provider:
-            return web.json_response(
-                {"error": "No provider configured"}, status=503
-            )
-
-        # Resolve model: check aliases, fall back to active model if "default"
+            return web.json_response({"error": "No provider configured"}, status=503)
         if model == "default":
             actual_model = self._active_model or "default"
         else:
             actual_model = self._resolve_model_alias(model)
-        
         provider_model = self._provider.model_param(actual_model)
-
         if stream:
-            response = web.StreamResponse(
-                status=200,
-                headers={
-                    "Content-Type": "application/x-ndjson",
-                    "Cache-Control": "no-cache",
-                },
-            )
+            response = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson", "Cache-Control": "no-cache"})
             await response.prepare(request)
-
             try:
-                async for token, done, _ in self._stream_chat(provider_model, messages, options):
+                async for token, done, _, _ in self._stream_chat(provider_model, messages, options):
                     chunk = make_ollama_chat_stream_chunk(token, done)
                     await response.write(chunk.encode("utf-8"))
                     if done:
@@ -440,7 +368,6 @@ class ProxyServer:
                     await response.write(err_chunk.encode("utf-8"))
                 except Exception:
                     pass
-
             try:
                 await response.write_eof()
             except Exception:
@@ -455,77 +382,38 @@ class ProxyServer:
                 logger.error(f"Chat error: {e}")
                 return web.json_response({"error": str(e)}, status=502)
 
-    async def _non_stream_chat(
-        self, model: str, messages: List[Dict[str, str]], options: Dict[str, Any]
-    ) -> dict:
-        """Make a non-streaming chat completion request to the provider."""
+    async def _non_stream_chat(self, model: str, messages: List[Dict[str, str]], options: Dict[str, Any]) -> dict:
         if not self._provider:
             raise RuntimeError("No provider configured")
-
         payload = self._provider.prepare_chat_payload(model, messages, False, options)
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "LLamification/0.1",
-        }
+        headers = {"Content-Type": "application/json", "User-Agent": "LLamification/0.1"}
         if self._provider.api_key:
             headers["Authorization"] = f"Bearer {self._provider.api_key}"
-
         url = self._provider.api_base()
         logger.info(f"POST {url}")
-        logger.info(f"Model: {payload.get('model')}, Stream: {payload.get('stream')}")
-
         connector = aiohttp.TCPConnector(force_close=True)
         async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
-            async with session.post(
-                url,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as resp:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=120)) as resp:
                 if resp.status != 200:
                     err_text = await resp.text()
-                    logger.error(f"Provider {resp.status} from {url}: {err_text[:500]}")
                     raise RuntimeError(f"Provider returned {resp.status}: {err_text}")
                 return await resp.json()
 
-    async def _stream_chat(
-        self, model: str, messages: List[Dict[str, str]], options: Dict[str, Any]
-    ) -> "asyncio.AsyncIterator[tuple[str, bool, Optional[dict]]]":
-        """Make a streaming chat completion, yielding (token, done, tool_delta) tuples.
-
-        ``tool_delta`` is non-None when the upstream emits an incremental
-        tool-call delta (OpenAI streaming ``delta.tool_calls``); ``token``
-        is empty in that case. Plain content tokens yield ``(content, False, None)``
-        and completion yields ``("", True, None)``.
-        """
+    async def _stream_chat(self, model: str, messages: List[Dict[str, str]], options: Dict[str, Any]):
         if not self._provider:
             raise RuntimeError("No provider configured")
-
         payload = self._provider.prepare_chat_payload(model, messages, True, options)
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            "User-Agent": "LLamification/0.1",
-        }
+        headers = {"Content-Type": "application/json", "Accept": "text/event-stream", "User-Agent": "LLamification/0.1"}
         if self._provider.api_key:
             headers["Authorization"] = f"Bearer {self._provider.api_key}"
-
         url = self._provider.api_base()
         logger.info(f"Stream POST {url}")
-        logger.info(f"Model: {payload.get('model')}")
-
         connector = aiohttp.TCPConnector(force_close=True)
         async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
-            async with session.post(
-                url,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=300),
-            ) as resp:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=300)) as resp:
                 if resp.status != 200:
                     err_text = await resp.text()
-                    logger.error(f"Provider stream {resp.status} from {url}: {err_text[:500]}")
                     raise RuntimeError(f"Provider returned {resp.status}: {err_text}")
-
-                # Parse Server-Sent Events
                 buffer = ""
                 async for chunk in resp.content:
                     buffer += chunk.decode("utf-8", errors="replace")
@@ -535,13 +423,13 @@ class ProxyServer:
                         if not line:
                             continue
                         if line.startswith("data: "):
-                            data_str = line[6:]  # strip "data: " prefix
+                            data_str = line[6:]
                             if data_str.strip() == "[DONE]":
-                                yield ("", True, None)
+                                yield ("", True, None, None)
                                 return
                             try:
                                 data = json.loads(data_str)
-                                # Extract content delta
+                                usage = data.get("usage")
                                 choices = data.get("choices", [])
                                 if choices:
                                     delta = choices[0].get("delta", {})
@@ -549,21 +437,21 @@ class ProxyServer:
                                     tool_calls = delta.get("tool_calls")
                                     finish_reason = choices[0].get("finish_reason")
                                     if content:
-                                        yield (content, False, None)
+                                        yield (content, False, None, None)
                                     if tool_calls:
                                         for tc in tool_calls:
-                                            yield ("", False, tc)
+                                            yield ("", False, tc, None)
                                     if finish_reason in ("stop", "tool_calls"):
-                                        yield ("", True, None)
+                                        yield ("", True, None, usage)
                                         return
+                                elif usage:
+                                    yield ("", True, None, usage)
+                                    return
                             except json.JSONDecodeError:
                                 logger.warning(f"Failed to parse SSE: {data_str[:200]}")
-
-                # If we get here without a finish, send done
-                yield ("", True, None)
+                yield ("", True, None, None)
 
     async def start(self) -> None:
-        """Start the server."""
         self._runner = web.AppRunner(self.app)
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, self.host, self.port)
@@ -571,7 +459,6 @@ class ProxyServer:
         logger.info(f"Proxy server started on {self.host}:{self.port}")
 
     async def stop(self) -> None:
-        """Stop the server."""
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
