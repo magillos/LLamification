@@ -53,11 +53,36 @@ Then you can start the proxy by just typing `llamification` in your terminal.
 1. Run `python3 -m llamification -g` to open the GUI.
 2. Add a provider (name, base URL, API key), then click "Refresh Models" to fetch the available models.
 3. Select a model and click "Start Proxy".
-4. The proxy now runs on `http://localhost:4001` and speaks the Ollama API.
+4. The proxy now runs on `http://localhost:4001` and speaks both the Ollama API and the OpenAI-compatible API.
 
 The next time you run `python3 -m llamification` (without the `-g` flag), it starts headlessly with your last settings.
 
 The default port is `4001` so you can run it alongside a real Ollama server without conflicts. Change the port in the GUI or in `~/.config/llamification/config.json`.
+
+### Supported endpoints
+
+**Ollama-compatible:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET  | `/`              | Health check ("Ollama is running") |
+| GET  | `/api/tags`       | List available models |
+| POST | `/api/generate`   | Generate text |
+| POST | `/api/chat`       | Chat completion |
+| POST | `/api/embeddings` | Embeddings (proxied to upstream) |
+
+**OpenAI-compatible:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET  | `/v1`                 | Health check |
+| GET  | `/v1/models`           | List available models |
+| POST | `/v1/chat/completions` | Chat completion (with function-calling / tools support) |
+| POST | `/v1/embeddings`       | Embeddings (proxied to upstream) |
+
+### Tool / function calling
+
+`/v1/chat/completions` transparently passes the `tools` and `tool_choice` fields from the request to the upstream provider, and forwards any `tool_calls` in the response — both streaming and non-streaming. This means agentic clients like Cline, Continue, and Roo Code can use tools through the proxy without modification.
 
 ## Configuration
 

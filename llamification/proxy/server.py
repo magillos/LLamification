@@ -58,10 +58,12 @@ class ProxyServer:
       GET  /api/tags          -> list available models
       POST /api/generate      -> generate text
       POST /api/chat          -> chat completion
+      POST /api/embeddings    -> embeddings (proxied to upstream)
 
     OpenAI-compatible routes:
       GET  /v1/models         -> list available models
-      POST /v1/chat/completions -> chat completion
+      POST /v1/chat/completions -> chat completion (with tools pass-through)
+      POST /v1/embeddings     -> embeddings (proxied to upstream)
     """
 
     def __init__(self, host: str = "127.0.0.1", port: int = 11434):
@@ -82,11 +84,13 @@ class ProxyServer:
         self.app.router.add_get("/api/tags", self.handle_tags)
         self.app.router.add_post("/api/generate", self.handle_generate)
         self.app.router.add_post("/api/chat", self.handle_chat)
+        self.app.router.add_post("/api/embeddings", self.handle_v1_embeddings)
 
         # OpenAI-compatible endpoints
         self.app.router.add_get("/v1", self.handle_v1_root)  # some apps check this
         self.app.router.add_get("/v1/models", self.handle_v1_models)
         self.app.router.add_post("/v1/chat/completions", self.handle_v1_chat)
+        self.app.router.add_post("/v1/embeddings", self.handle_v1_embeddings)
 
     def configure(self, provider: LLMProvider, models: List[str], active_model: str, allow_client_override: bool = True):
         """Set the current provider, available models, active model, and override setting."""
@@ -185,6 +189,14 @@ class ProxyServer:
         }
         if "stop" in body:
             options["stop"] = body["stop"]
+        # Pass through function-calling fields so agentic clients (Cline,
+        # Continue, Roo Code, etc.) can use tools through the proxy.
+        # These are only present when the client explicitly requests them,
+        # so plain chat requests are unaffected.
+        if "tools" in body:
+            options["tools"] = body["tools"]
+        if "tool_choice" in body:
+            options["tool_choice"] = body["tool_choice"]
 
         if not self._provider:
             return web.json_response({"error": "No provider configured"}, status=503)
@@ -215,10 +227,16 @@ class ProxyServer:
             await response.prepare(request)
 
             try:
-                async for token, done in self._stream_chat(provider_model, messages, options):
+                async for token, done, tool_delta in self._stream_chat(provider_model, messages, options):
                     if done:
                         chunk_data = {
                             "choices": [{"delta": {}, "finish_reason": "stop", "index": 0}],
+                        }
+                    elif tool_delta is not None:
+                        # Forward tool-call deltas from the upstream so agentic
+                        # clients receive incremental function-call arguments.
+                        chunk_data = {
+                            "choices": [{"delta": {"tool_calls": [tool_delta]}, "index": 0}],
                         }
                     else:
                         chunk_data = {
@@ -248,10 +266,19 @@ class ProxyServer:
                 provider_resp = await self._non_stream_chat(provider_model, messages, options)
                 # Return in OpenAI format
                 content = ""
+                tool_calls = None
+                finish_reason = "stop"
                 try:
-                    content = provider_resp["choices"][0]["message"]["content"]
+                    msg = provider_resp["choices"][0]["message"]
+                    content = msg.get("content", "") or ""
+                    tool_calls = msg.get("tool_calls")
+                    if tool_calls:
+                        finish_reason = "tool_calls"
                 except (KeyError, IndexError):
                     pass
+                assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
+                if tool_calls:
+                    assistant_msg["tool_calls"] = tool_calls
                 openai_resp = {
                     "id": "chatcmpl-llamification",
                     "object": "chat.completion",
@@ -260,16 +287,57 @@ class ProxyServer:
                     "choices": [
                         {
                             "index": 0,
-                            "message": {"role": "assistant", "content": content},
-                            "finish_reason": "stop",
+                            "message": assistant_msg,
+                            "finish_reason": finish_reason,
                         }
                     ],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    "usage": provider_resp.get(
+                        "usage",
+                        {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    ),
                 }
                 return web.json_response(openai_resp, status=200)
             except Exception as e:
                 logger.error(f"V1 chat error: {e}")
                 return web.json_response({"error": str(e)}, status=502)
+
+    async def handle_v1_embeddings(self, request: web.Request) -> web.Response:
+        """OpenAI-compatible POST /v1/embeddings (also serves /api/embeddings).
+
+        Proxies the request body to the upstream provider's ``/embeddings``
+        endpoint and returns its response unchanged.
+        """
+        if not self._provider:
+            return web.json_response({"error": "No provider configured"}, status=503)
+        body = await request.json()
+        url = f"{self._provider.base_url}/embeddings"
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "LLamification/0.1",
+        }
+        if self._provider.api_key:
+            headers["Authorization"] = f"Bearer {self._provider.api_key}"
+        logger.info(f"Embeddings POST {url}")
+        connector = aiohttp.TCPConnector(force_close=True)
+        try:
+            async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
+                async with session.post(
+                    url,
+                    json=body,
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as resp:
+                    if resp.status != 200:
+                        err_text = await resp.text()
+                        logger.error(f"Embeddings {resp.status} from {url}: {err_text[:500]}")
+                        return web.json_response(
+                            {"error": f"Provider returned {resp.status}: {err_text}"},
+                            status=502,
+                        )
+                    data = await resp.json()
+                    return web.json_response(data, status=200)
+        except Exception as e:
+            logger.error(f"Embeddings error: {e}")
+            return web.json_response({"error": str(e)}, status=502)
 
     async def handle_generate(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
@@ -302,7 +370,7 @@ class ProxyServer:
             await response.prepare(request)
 
             try:
-                async for token, done in self._stream_chat(provider_model, messages, options):
+                async for token, done, _ in self._stream_chat(provider_model, messages, options):
                     chunk = make_ollama_stream_chunk(token, done)
                     await response.write(chunk.encode("utf-8"))
                     if done:
@@ -360,7 +428,7 @@ class ProxyServer:
             await response.prepare(request)
 
             try:
-                async for token, done in self._stream_chat(provider_model, messages, options):
+                async for token, done, _ in self._stream_chat(provider_model, messages, options):
                     chunk = make_ollama_chat_stream_chunk(token, done)
                     await response.write(chunk.encode("utf-8"))
                     if done:
@@ -421,8 +489,14 @@ class ProxyServer:
 
     async def _stream_chat(
         self, model: str, messages: List[Dict[str, str]], options: Dict[str, Any]
-    ) -> "asyncio.AsyncIterator[tuple[str, bool]]":
-        """Make a streaming chat completion, yielding (token, done) tuples."""
+    ) -> "asyncio.AsyncIterator[tuple[str, bool, Optional[dict]]]":
+        """Make a streaming chat completion, yielding (token, done, tool_delta) tuples.
+
+        ``tool_delta`` is non-None when the upstream emits an incremental
+        tool-call delta (OpenAI streaming ``delta.tool_calls``); ``token``
+        is empty in that case. Plain content tokens yield ``(content, False, None)``
+        and completion yields ``("", True, None)``.
+        """
         if not self._provider:
             raise RuntimeError("No provider configured")
 
@@ -463,7 +537,7 @@ class ProxyServer:
                         if line.startswith("data: "):
                             data_str = line[6:]  # strip "data: " prefix
                             if data_str.strip() == "[DONE]":
-                                yield ("", True)
+                                yield ("", True, None)
                                 return
                             try:
                                 data = json.loads(data_str)
@@ -472,17 +546,21 @@ class ProxyServer:
                                 if choices:
                                     delta = choices[0].get("delta", {})
                                     content = delta.get("content", "")
+                                    tool_calls = delta.get("tool_calls")
                                     finish_reason = choices[0].get("finish_reason")
                                     if content:
-                                        yield (content, False)
-                                    if finish_reason == "stop":
-                                        yield ("", True)
+                                        yield (content, False, None)
+                                    if tool_calls:
+                                        for tc in tool_calls:
+                                            yield ("", False, tc)
+                                    if finish_reason in ("stop", "tool_calls"):
+                                        yield ("", True, None)
                                         return
                             except json.JSONDecodeError:
                                 logger.warning(f"Failed to parse SSE: {data_str[:200]}")
 
                 # If we get here without a finish, send done
-                yield ("", True)
+                yield ("", True, None)
 
     async def start(self) -> None:
         """Start the server."""

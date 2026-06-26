@@ -90,6 +90,13 @@ class OpenAICompatibleProvider(LLMProvider):
         }
         if "stop" in options:
             payload["stop"] = options["stop"]
+        # Forward function-calling fields so agentic clients (Cline, Continue,
+        # etc.) can use tools through the proxy. These are only present when
+        # the client explicitly requests them, so plain chat is unaffected.
+        if "tools" in options:
+            payload["tools"] = options["tools"]
+        if "tool_choice" in options:
+            payload["tool_choice"] = options["tool_choice"]
         return payload
 
     def _parse_models(self, data: dict) -> List[Dict[str, str]]:
