@@ -117,6 +117,29 @@ class ProxyServer:
             return resolved
         return model
 
+    def _resolve_to_active_model(self, model: str) -> str:
+        """Upgrade a client-sent model to the active model when it's a prefix.
+
+        Some providers accept suffixed model names (e.g. ``glm-5.2-short-flex``)
+        that enable features like queued/discounted inference.  Clients like
+        aurscan send the base name (``glm-5.2-short``) without the suffix, which
+        causes the provider to use the non-suffixed variant.
+
+        If the active model starts with ``model + "-"`` (e.g. ``glm-5.2-short``
+        is a prefix of ``glm-5.2-short-flex``), replace the requested model
+        with the active model so the suffix is always preserved.
+        """
+        if (
+            self._active_model
+            and model != self._active_model
+            and self._active_model.startswith(model + "-")
+        ):
+            logger.info(
+                f"Model prefix-matched: '{model}' -> active model '{self._active_model}'"
+            )
+            return self._active_model
+        return model
+
     def _error_response(self, error: Exception, status: int = 502) -> web.Response:
         """Format an error as an OpenAI-style error response."""
         msg = str(error)
@@ -206,6 +229,7 @@ class ProxyServer:
             actual_model = self._active_model or "default"
         else:
             actual_model = self._resolve_model_alias(model)
+            actual_model = self._resolve_to_active_model(actual_model)
 
         provider_model = self._provider.model_param(actual_model)
 
@@ -342,6 +366,7 @@ class ProxyServer:
             actual_model = self._active_model or "default"
         else:
             actual_model = self._resolve_model_alias(model)
+            actual_model = self._resolve_to_active_model(actual_model)
         provider_model = self._provider.model_param(actual_model)
         if stream:
             response = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson", "Cache-Control": "no-cache"})
@@ -384,6 +409,7 @@ class ProxyServer:
             actual_model = self._active_model or "default"
         else:
             actual_model = self._resolve_model_alias(model)
+            actual_model = self._resolve_to_active_model(actual_model)
         provider_model = self._provider.model_param(actual_model)
         if stream:
             response = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson", "Cache-Control": "no-cache"})
