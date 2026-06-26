@@ -43,6 +43,11 @@ def _parse_args(argv=None):
         action="store_true",
         help="Launch the graphical interface (default is headless)",
     )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose debug logging (request/response payloads)",
+    )
     return parser.parse_args(argv)
 
 
@@ -51,7 +56,7 @@ def main(argv=None):
     args = _parse_args(argv)
 
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
@@ -59,7 +64,7 @@ def main(argv=None):
     if args.gui:
         _run_gui()
     else:
-        _run_headless()
+        _run_headless(verbose=args.verbose)
 
 
 def _run_gui():
@@ -96,7 +101,7 @@ def _run_gui():
     sys.exit(app.exec())
 
 
-def _run_headless():
+def _run_headless(verbose: bool = False):
     """Run LLamification in headless mode: load config, start proxy, serve forever."""
 
     # --- Load and validate config ---
@@ -150,7 +155,7 @@ def _run_headless():
         print(f"{_colourise('✗', _PASTEL_RED)} Failed to create provider: {e}")
         sys.exit(1)
 
-    server = ProxyServer(host="127.0.0.1", port=port)
+    server = ProxyServer(host="127.0.0.1", port=port, verbose=verbose)
     server.configure(provider, [model], model, allow_override)
 
     logger.info(f"LLamification headless mode — provider={provider_key}, model={model}, port={port}")

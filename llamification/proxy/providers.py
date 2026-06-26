@@ -103,6 +103,11 @@ class OpenAICompatibleProvider(LLMProvider):
         # Forward stream options (e.g. include_usage for token counting).
         if "stream_options" in options:
             payload["stream_options"] = options["stream_options"]
+        # Forward logprobs requests for evaluation / debugging tools.
+        if "logprobs" in options:
+            payload["logprobs"] = options["logprobs"]
+        if "top_logprobs" in options:
+            payload["top_logprobs"] = options["top_logprobs"]
         # Forward additional sampling parameters that agentic clients may set.
         for key in ("presence_penalty", "frequency_penalty", "seed", "n"):
             if key in options:

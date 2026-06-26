@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import uuid
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -57,6 +58,7 @@ class ProxyServer:
       GET  /api/tags          -> list available models
       POST /api/generate      -> generate text
       POST /api/chat          -> chat completion (with tools support)
+      GET  /api/version       -> version info
       POST /api/embeddings    -> embeddings (proxied to upstream)
 
     OpenAI-compatible routes:
@@ -65,7 +67,7 @@ class ProxyServer:
       POST /v1/embeddings     -> embeddings (proxied to upstream)
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 11434):
+    def __init__(self, host: str = "127.0.0.1", port: int = 11434, verbose: bool = False):
         self.host = host
         self.port = port
         self._provider: Optional[LLMProvider] = None
@@ -75,11 +77,13 @@ class ProxyServer:
         self._model_aliases: Dict[str, str] = {}
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
+        self._verbose: bool = verbose
 
         self.app = web.Application(middlewares=[cors_middleware])
 
         self.app.router.add_get("/", self.handle_root)
         self.app.router.add_get("/api/tags", self.handle_tags)
+        self.app.router.add_get("/api/version", self.handle_version)
         self.app.router.add_post("/api/generate", self.handle_generate)
         self.app.router.add_post("/api/chat", self.handle_chat)
         self.app.router.add_post("/api/embeddings", self.handle_v1_embeddings)
@@ -113,8 +117,29 @@ class ProxyServer:
             return resolved
         return model
 
+    def _error_response(self, error: Exception, status: int = 502) -> web.Response:
+        """Format an error as an OpenAI-style error response."""
+        msg = str(error)
+        code = None
+        if "Provider returned" in msg:
+            try:
+                code = int(msg.split("Provider returned ")[1].split(":")[0])
+            except (ValueError, IndexError):
+                pass
+        err_body = {
+            "error": {
+                "message": msg,
+                "type": "upstream_error" if code else "proxy_error",
+                "code": code,
+            }
+        }
+        return web.json_response(err_body, status=status)
+
     async def handle_root(self, request: web.Request) -> web.Response:
         return web.json_response({"status": "Ollama is running"}, status=200)
+
+    async def handle_version(self, request: web.Request) -> web.Response:
+        return web.json_response({"version": "0.1.0"}, status=200)
 
     async def handle_tags(self, request: web.Request) -> web.Response:
         if not self._models:
@@ -166,6 +191,10 @@ class ProxyServer:
             options["response_format"] = body["response_format"]
         if "stream_options" in body:
             options["stream_options"] = body["stream_options"]
+        if "logprobs" in body:
+            options["logprobs"] = body["logprobs"]
+        if "top_logprobs" in body:
+            options["top_logprobs"] = body["top_logprobs"]
         for key in ("presence_penalty", "frequency_penalty", "seed", "n"):
             if key in body:
                 options[key] = body[key]
@@ -192,6 +221,10 @@ class ProxyServer:
                 },
             )
             await response.prepare(request)
+
+            # Emit initial role chunk as OpenAI does.
+            role_chunk = {"choices": [{"delta": {"role": "assistant"}, "index": 0}]}
+            await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode("utf-8"))
 
             stream_opts = body.get("stream_options", {})
             include_usage = (
@@ -275,7 +308,7 @@ class ProxyServer:
                 return web.json_response(openai_resp, status=200)
             except Exception as e:
                 logger.error(f"V1 chat error: {e}")
-                return web.json_response({"error": str(e)}, status=502)
+                return self._error_response(e, 502)
     async def handle_v1_embeddings(self, request: web.Request) -> web.Response:
         if not self._provider:
             return web.json_response({"error": "No provider configured"}, status=503)
@@ -296,7 +329,7 @@ class ProxyServer:
                     return web.json_response(data, status=200)
         except Exception as e:
             logger.error(f"Embeddings error: {e}")
-            return web.json_response({"error": str(e)}, status=502)
+            return self._error_response(e, 502)
 
     async def handle_generate(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
@@ -338,7 +371,7 @@ class ProxyServer:
                 return web.json_response(ollama_resp, status=200)
             except Exception as e:
                 logger.error(f"Generate error: {e}")
-                return web.json_response({"error": str(e)}, status=502)
+                return self._error_response(e, 502)
 
     async def handle_chat(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
@@ -380,7 +413,7 @@ class ProxyServer:
                 return web.json_response(ollama_resp, status=200)
             except Exception as e:
                 logger.error(f"Chat error: {e}")
-                return web.json_response({"error": str(e)}, status=502)
+                return self._error_response(e, 502)
 
     async def _non_stream_chat(self, model: str, messages: List[Dict[str, str]], options: Dict[str, Any]) -> dict:
         if not self._provider:
@@ -391,13 +424,20 @@ class ProxyServer:
             headers["Authorization"] = f"Bearer {self._provider.api_key}"
         url = self._provider.api_base()
         logger.info(f"POST {url}")
+        if self._verbose:
+            logger.debug(f"Request payload: {json.dumps(payload)[:2000]}")
         connector = aiohttp.TCPConnector(force_close=True)
         async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=120)) as resp:
                 if resp.status != 200:
                     err_text = await resp.text()
+                    if self._verbose:
+                        logger.debug(f"Upstream error {resp.status}: {err_text[:1000]}")
                     raise RuntimeError(f"Provider returned {resp.status}: {err_text}")
-                return await resp.json()
+                result = await resp.json()
+                if self._verbose:
+                    logger.debug(f"Response: {json.dumps(result)[:2000]}")
+                return result
 
     async def _stream_chat(self, model: str, messages: List[Dict[str, str]], options: Dict[str, Any]):
         if not self._provider:
@@ -408,6 +448,8 @@ class ProxyServer:
             headers["Authorization"] = f"Bearer {self._provider.api_key}"
         url = self._provider.api_base()
         logger.info(f"Stream POST {url}")
+        if self._verbose:
+            logger.debug(f"Stream request payload: {json.dumps(payload)[:2000]}")
         connector = aiohttp.TCPConnector(force_close=True)
         async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=300)) as resp:
