@@ -288,7 +288,7 @@ class MainWindow(QMainWindow):
         # Wire the custom-URL row actions.
         self.remove_custom_btn.clicked.connect(self._on_remove_custom_clicked)
         self.edit_custom_btn.clicked.connect(self._on_edit_custom_clicked)
-        # Persist URL edits to the active custom provider immediately.
+        # Apply inline URL edits to the running proxy only (not persisted).
         self.custom_url_edit.editingFinished.connect(self._on_custom_url_edited)
 
     # --- Provider combo (built-ins + dynamic custom entries) ---
@@ -352,33 +352,16 @@ class MainWindow(QMainWindow):
         return is_custom
 
     def _on_custom_url_edited(self):
-        """Persist an inline Base URL edit to the active custom provider.
+        """Apply an inline Base URL edit to the running proxy *only*.
 
-        When the entry's name still matches the *previous* host (i.e. it was
-        host-derived and the user never renamed it), the name is updated to the
-        new host and the combo label refreshes accordingly.
+        The change is **not** persisted to config — it resets when the app
+        restarts or the provider is re-selected via the dropdown. Use the
+        Edit Provider dialog to permanently change the saved URL.
         """
         provider_key = self.provider_combo.currentData()
         if not is_custom_provider(provider_key):
             return
-        cfg = load_config()
-        cp = cfg.setdefault("custom_providers", {})
-        cp_id = custom_provider_id(provider_key)
-        if cp_id not in cp:
-            return
-        info = cp[cp_id]
         new_url = self.custom_url_edit.text().strip()
-        old_host = host_from_url(info.get("base_url", ""))
-        new_host = host_from_url(new_url)
-        # If the name was the host-derived default, follow the host change.
-        if new_host and info.get("name", "").strip() in ("", "Custom Provider", old_host):
-            info["name"] = new_host
-        info["base_url"] = new_url
-        save_config(cfg)
-        # Refresh the combo label in place + update the running provider URL.
-        idx = self.provider_combo.findData(provider_key)
-        if idx >= 0:
-            self.provider_combo.setItemText(idx, info["name"])
         if self._provider_instance:
             self._provider_instance.base_url = new_url.rstrip("/")
 
@@ -695,12 +678,6 @@ class MainWindow(QMainWindow):
         models[provider_key] = self.model_combo.currentText().strip()
         cfg["models"] = models
 
-        # Persist Base URL for custom providers
-        if is_custom_provider(provider_key):
-            cp = cfg.setdefault("custom_providers", {})
-            cp_id = custom_provider_id(provider_key)
-            if cp_id in cp:
-                cp[cp_id]["base_url"] = self.custom_url_edit.text().strip()
         cfg["allow_client_override"] = self.allow_override_cb.isChecked()
         cfg["show_tray_icon"] = self.show_tray_cb.isChecked()
 
