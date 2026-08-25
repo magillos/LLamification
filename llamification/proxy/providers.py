@@ -6,10 +6,13 @@ configured with a name, base URL, and API key. ``get_provider`` builds a single
 generic :class:`OpenAICompatibleProvider` for any of them.
 """
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import aiohttp
+
+logger = logging.getLogger("llamification.proxy.providers")
 
 
 class LLMProvider(ABC):
@@ -97,9 +100,15 @@ class OpenAICompatibleProvider(LLMProvider):
             payload["tools"] = options["tools"]
         if "tool_choice" in options:
             payload["tool_choice"] = options["tool_choice"]
-        # Forward structured-output / JSON-mode requests.
-        if "response_format" in options:
-            payload["response_format"] = options["response_format"]
+        # Forward structured-output / JSON-mode requests. Some OpenAI-compatible
+        # servers (e.g. LM Studio) only accept ``response_format.type`` values
+        # of ``json_schema`` or ``text`` and hard-reject OpenAI's ``json_object``
+        # mode, so normalize the field before sending it upstream.
+        response_format = options.get("response_format")
+        if isinstance(response_format, dict):
+            normalized = self._normalize_response_format(response_format)
+            if normalized is not None:
+                payload["response_format"] = normalized
         # Forward stream options (e.g. include_usage for token counting).
         if "stream_options" in options:
             payload["stream_options"] = options["stream_options"]
@@ -113,6 +122,34 @@ class OpenAICompatibleProvider(LLMProvider):
             if key in options:
                 payload[key] = options[key]
         return payload
+
+    @staticmethod
+    def _normalize_response_format(rf: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Adapt ``response_format`` to the least-common-denominator subset.
+
+        ``json_schema`` and ``text`` are passed through verbatim. OpenAI's
+        ``json_object`` mode is translated into an equivalent permissive
+        ``json_schema`` request (any object), which backends like LM Studio
+        accept while preserving the client's intent. Unrecognized types are
+        dropped with a warning rather than forwarded and causing a hard 400.
+        """
+        rf_type = rf.get("type")
+        if rf_type in ("json_schema", "text"):
+            return rf
+        if rf_type == "json_object":
+            js = rf.get("json_schema")
+            name = js.get("name", "response") if isinstance(js, dict) else "response"
+            logger.info("Translated response_format 'json_object' into permissive 'json_schema'")
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": name,
+                    "strict": False,
+                    "schema": {"type": "object"},
+                },
+            }
+        logger.warning(f"Dropping unsupported response_format type: {rf_type!r}")
+        return None
 
     def _parse_models(self, data: dict) -> List[Dict[str, str]]:
         models = []
