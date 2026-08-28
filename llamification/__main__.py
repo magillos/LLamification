@@ -119,12 +119,13 @@ def _run_headless(verbose: bool = False):
         sys.exit(1)
 
     api_keys = cfg.get("api_keys", {})
-    api_key = api_keys.get(provider_key, "")
+    api_key = api_keys.get(provider_key, "") if isinstance(api_keys, dict) else ""
+    # Local OpenAI-compatible servers such as llama.cpp commonly do not use
+    # authentication. The GUI intentionally labels this field optional, so an
+    # empty key must not prevent headless startup; the provider omits the
+    # Authorization header when the key is empty.
     if not api_key:
-        p_name = f"'{provider_key}'"
-        print(f"{_colourise('✗', _PASTEL_RED)} No API key configured for provider {_colourise(p_name, _PASTEL_CYAN)}.")
-        print(f"  Run {_colourise('python -m llamification -g', _PASTEL_YELLOW)} first to set up an API key.")
-        sys.exit(1)
+        logger.info("No API key configured for %s; continuing without authentication.", provider_key)
 
     models_map = cfg.get("models", {})
     model = models_map.get(provider_key, "") if isinstance(models_map, dict) else ""

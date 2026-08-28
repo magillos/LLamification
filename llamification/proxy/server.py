@@ -281,12 +281,14 @@ class ProxyServer:
                             )
                         break
                 await response.write(b"data: [DONE]\n\n")
-            except (ConnectionError, asyncio.CancelledError) as e:
-                logger.info(f"V1 stream connection closed by client: {e}")
+            except (ConnectionError, asyncio.CancelledError, aiohttp.ClientConnectionError) as e:
+                logger.info(f"V1 stream connection closed: {e}")
             except Exception as e:
-                logger.error(f"V1 stream error: {e}")
+                logger.error(f"V1 stream error: {e}", exc_info=self._verbose)
                 try:
-                    await response.write(json.dumps({"error": str(e)}).encode("utf-8"))
+                    await response.write(
+                        f"data: {json.dumps({'error': {'message': str(e), 'type': 'proxy_error'}})}\n\n".encode("utf-8")
+                    )
                 except Exception:
                     pass
 
@@ -330,8 +332,11 @@ class ProxyServer:
                     ),
                 }
                 return web.json_response(openai_resp, status=200)
+            except asyncio.TimeoutError as e:
+                logger.error("V1 chat timed out waiting for upstream response", exc_info=self._verbose)
+                return self._error_response(RuntimeError("Upstream response timed out after 600 seconds of inactivity"), 502)
             except Exception as e:
-                logger.error(f"V1 chat error: {e}")
+                logger.error(f"V1 chat error: {e!r}", exc_info=self._verbose)
                 return self._error_response(e, 502)
     async def handle_v1_embeddings(self, request: web.Request) -> web.Response:
         if not self._provider:
@@ -452,9 +457,13 @@ class ProxyServer:
         logger.info(f"POST {url}")
         if self._verbose:
             logger.debug(f"Request payload: {json.dumps(payload)[:2000]}")
+        # A completion may take longer than two minutes. Use a generous
+        # inactivity timeout rather than a short total request deadline; active
+        # upstream streaming is handled separately by _stream_chat.
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=600)
         connector = aiohttp.TCPConnector(force_close=True)
         async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+            async with session.post(url, json=payload, timeout=timeout) as resp:
                 if resp.status != 200:
                     err_text = await resp.text()
                     if self._verbose:
@@ -476,47 +485,66 @@ class ProxyServer:
         logger.info(f"Stream POST {url}")
         if self._verbose:
             logger.debug(f"Stream request payload: {json.dumps(payload)[:2000]}")
+        # Do not use a total timeout for a streamed completion. Long generations
+        # can legitimately exceed it even while tokens are arriving regularly.
+        # Keep a generous socket-read timeout instead, so a genuinely stalled
+        # upstream still fails rather than hanging forever.
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300)
         connector = aiohttp.TCPConnector(force_close=True)
         async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+            async with session.post(url, json=payload, timeout=timeout) as resp:
                 if resp.status != 200:
                     err_text = await resp.text()
                     raise RuntimeError(f"Provider returned {resp.status}: {err_text}")
                 buffer = ""
                 async for chunk in resp.content:
                     buffer += chunk.decode("utf-8", errors="replace")
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        line = line.strip()
-                        if not line:
+                    # SSE events are separated by a blank line. Parsing complete
+                    # events (rather than individual TCP chunks) also handles
+                    # JSON split across multiple network reads.
+                    while "\n\n" in buffer or "\r\n\r\n" in buffer:
+                        separator = "\r\n\r\n" if "\r\n\r\n" in buffer else "\n\n"
+                        event, buffer = buffer.split(separator, 1)
+                        data_lines = [
+                            line[5:].lstrip() for line in event.replace("\r\n", "\n").split("\n")
+                            if line.startswith("data:")
+                        ]
+                        if not data_lines:
                             continue
-                        if line.startswith("data: "):
-                            data_str = line[6:]
-                            if data_str.strip() == "[DONE]":
-                                yield ("", True, None, None)
+                        data_str = "\n".join(data_lines)
+                        if data_str.strip() == "[DONE]":
+                            yield ("", True, None, None)
+                            return
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            logger.warning(f"Failed to parse SSE event: {data_str[:200]}")
+                            continue
+                        usage = data.get("usage")
+                        choices = data.get("choices", [])
+                        if choices:
+                            delta = choices[0].get("delta", {}) or {}
+                            content = delta.get("content", "") or ""
+                            tool_calls = delta.get("tool_calls")
+                            finish_reason = choices[0].get("finish_reason")
+                            if content:
+                                yield (content, False, None, None)
+                            if tool_calls:
+                                for tc in tool_calls:
+                                    yield ("", False, tc, None)
+                            if finish_reason in ("stop", "tool_calls"):
+                                yield ("", True, None, usage)
                                 return
-                            try:
-                                data = json.loads(data_str)
-                                usage = data.get("usage")
-                                choices = data.get("choices", [])
-                                if choices:
-                                    delta = choices[0].get("delta", {})
-                                    content = delta.get("content", "")
-                                    tool_calls = delta.get("tool_calls")
-                                    finish_reason = choices[0].get("finish_reason")
-                                    if content:
-                                        yield (content, False, None, None)
-                                    if tool_calls:
-                                        for tc in tool_calls:
-                                            yield ("", False, tc, None)
-                                    if finish_reason in ("stop", "tool_calls"):
-                                        yield ("", True, None, usage)
-                                        return
-                                elif usage:
-                                    yield ("", True, None, usage)
-                                    return
-                            except json.JSONDecodeError:
-                                logger.warning(f"Failed to parse SSE: {data_str[:200]}")
+                        elif usage:
+                            yield ("", True, None, usage)
+                            return
+                # Process a final event if the upstream closes without a trailing
+                # blank line (some llama.cpp builds do this).
+                event = buffer.replace("\r\n", "\n")
+                data_lines = [line[5:].lstrip() for line in event.split("\n") if line.startswith("data:")]
+                if data_lines and "[DONE]" in "\n".join(data_lines):
+                    yield ("", True, None, None)
+                    return
                 yield ("", True, None, None)
 
     async def start(self) -> None:
