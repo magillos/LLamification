@@ -765,12 +765,13 @@ class MainWindow(QMainWindow):
         return model_id in self._favourites_for(self._current_provider_key())
 
     def _sorted_model_ids(self, model_ids: list) -> list:
-        """Lift favourites to the top, preserving the original order within
-        each group (favourites first, then the rest). Stable by construction."""
+        """Copy favourites to the top, keeping the original alphabetical list
+        intact below. A starred model therefore appears twice: once in the
+        pinned section at the top, once in its original position. Stable by
+        construction."""
         favourites = set(self._favourites_for(self._current_provider_key()))
         starred = [m for m in model_ids if m in favourites]
-        rest = [m for m in model_ids if m not in favourites]
-        return starred + rest
+        return starred + model_ids
 
     def _toggle_favourite(self, model_id: str):
         """Flip a model's favourite status, persist, and re-sort the combo."""
@@ -873,7 +874,12 @@ class MainWindow(QMainWindow):
         """Populate the model combo box with fetched models."""
         current = self.model_combo.currentText().strip()
 
-        # Sort favourites to the top (per current provider).
+        # Cache the unsorted list BEFORE pinning favourites: the pinned copy
+        # at the top is display-only, and re-sorting must start from the
+        # original list or duplicates would accumulate on every toggle.
+        self._models_cache = list(model_ids)
+
+        # Pin favourites to the top (original list stays intact below).
         model_ids = self._sorted_model_ids(model_ids)
 
         # Block signals temporarily to prevent redundant configure triggers
@@ -891,7 +897,6 @@ class MainWindow(QMainWindow):
                 self.model_combo.setCurrentIndex(-1)
         self.model_combo.blockSignals(False)
 
-        self._models_cache = model_ids
         # If server is running, notify it of model change
         if self._server and model_ids:
             active = self.model_combo.currentText().strip()
