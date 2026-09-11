@@ -5,8 +5,19 @@ import logging
 import threading
 from typing import List, Optional
 
-from PyQt6.QtCore import QMetaObject, QModelIndex, QRect, Qt, Q_ARG, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QTextCursor
+from PyQt6.QtCore import (
+    QEvent,
+    QMetaObject,
+    QModelIndex,
+    QObject,
+    QRect,
+    Qt,
+    QTimer,
+    Q_ARG,
+    pyqtSignal,
+    pyqtSlot,
+)
+from PyQt6.QtGui import QAction, QColor, QIcon, QMouseEvent, QPainter, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -94,15 +105,85 @@ class StarDelegate(QStyledItemDelegate):
         )
         painter.restore()
 
-    def editorEvent(self, event, model, option, index: QModelIndex) -> bool:
-        # Only react to left-button presses inside the star column.
-        if (event.type() == event.Type.MouseButtonPress
-                and event.button() == Qt.MouseButton.LeftButton
-                and event.position().toPoint().x() - option.rect.left()
-                <= self.STAR_COLUMN):
-            self._on_toggle(self._model_id(index))
-            return True  # consume the click so the row is not also selected
-        return super().editorEvent(event, model, option, index)
+    # NOTE: star clicks are NOT handled here. QComboBox's private popup
+    # container installs an event filter on the view viewport that turns a
+    # mouse *release* into row activation (selecting the model and closing the
+    # popup) — receiving editorEvent() is already too late to stop that. See
+    # ``StarViewportFilter`` / ``StarComboBox`` below, which intercept at the
+    # viewport level *before* the container's own filter runs.
+
+
+class StarViewportFilter(QObject):
+    """Event filter installed on a combo popup's view viewport.
+
+    It swallows mouse presses/releases that land on a row's leading star
+    column (toggling the favourite instead) so the combo's own popup container
+    never sees the release that would select the model and close the dropdown.
+    """
+
+    def __init__(self, view, combo, delegate: "StarDelegate"):
+        super().__init__(view)
+        self.view = view
+        self.combo = combo
+        self.delegate = delegate
+
+    def eventFilter(self, obj, event):
+        if event.type() not in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonRelease,
+        ):
+            return False
+        if not isinstance(event, QMouseEvent):
+            return False
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+
+        pos = event.position().toPoint()
+        index = self.view.indexAt(pos)
+        if not index.isValid():
+            return False
+
+        rect = self.view.visualRect(index)
+        if pos.x() - rect.left() <= self.delegate.STAR_COLUMN:
+            if event.type() == QEvent.Type.MouseButtonPress:
+                model_id = self.delegate._model_id(index)
+                # Defer the toggle: repopulating the combo is safe only once
+                # this mouse event has fully unwound.
+                QTimer.singleShot(0, lambda: self.delegate._on_toggle(model_id))
+            return True  # swallow press AND release
+        return False
+
+
+class StarComboBox(QComboBox):
+    """A ``QComboBox`` whose popup supports clickable star columns.
+
+    ``QComboBox``'s private popup container already installs an event filter on
+    the view viewport to translate mouse releases into row activation. We add
+    our own filter *after* each ``showPopup()`` (so it is the most recently
+    installed filter and therefore runs first), letting us intercept star
+    clicks before the container turns them into a selection.
+    """
+
+    def __init__(self, parent=None, is_favourite=None, on_toggle=None):
+        super().__init__(parent)
+        self._delegate = StarDelegate(self, is_favourite or (lambda _m: False),
+                                      on_toggle or (lambda _m: None))
+        self.setItemDelegate(self._delegate)
+        self._viewport_filter = None
+
+    def showPopup(self):
+        super().showPopup()
+        view = self.view()
+        viewport = view.viewport()
+        # Remove any previous filter (the popup container is recreated by
+        # QComboBox on each popup cycle), then install ours so it outranks it.
+        if self._viewport_filter is not None:
+            try:
+                viewport.removeEventFilter(self._viewport_filter)
+            except RuntimeError:
+                pass
+        self._viewport_filter = StarViewportFilter(view, self, self._delegate)
+        viewport.installEventFilter(self._viewport_filter)
 
 
 class MainWindow(QMainWindow):
@@ -209,14 +290,15 @@ class MainWindow(QMainWindow):
         # Model row
         mrow = QHBoxLayout()
         mrow.addWidget(QLabel("Model:"))
-        self.model_combo = QComboBox()
+        # Clickable ★/☆ next to each model; stars are favourites and float to
+        # top. StarComboBox installs a viewport filter so a star click toggles
+        # the favourite without selecting the model or closing the popup.
+        self.model_combo = StarComboBox(
+            self, self._is_favourite, self._toggle_favourite
+        )
         self.model_combo.setMinimumWidth(350)
         self.model_combo.setEditable(True)
         self.model_combo.setPlaceholderText("Select or type a model...")
-        # Clickable ★/☆ next to each model; stars are favourites and float to top
-        self.model_combo.setItemDelegate(
-            StarDelegate(self.model_combo, self._is_favourite, self._toggle_favourite)
-        )
 
         # Configure a custom QCompleter linked to the combobox model
         completer = QCompleter(self.model_combo.model(), self.model_combo)
