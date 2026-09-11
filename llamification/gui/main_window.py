@@ -873,13 +873,29 @@ class MainWindow(QMainWindow):
 
     def _resort_models(self):
         """Re-sort the combo's existing entries using the current favourites,
-        preserving the active selection text and the open popup state."""
+        preserving the active selection text, the open popup state, and the
+        popup's vertical scroll position.
+
+        Repopulating the combo (``clear()`` + ``addItems()``) resets the view's
+        scrollbar to the top, so an open dropdown would jump to the first row
+        on every star toggle. We capture the scroll value and restore it once
+        the popup has relaid out.
+        """
         if not self._models_cache:
             return
-        was_popup = self.model_combo.view().isVisible()
+        view = self.model_combo.view()
+        was_popup = view.isVisible()
+        scroll = view.verticalScrollBar().value()
         self._populate_models(list(self._models_cache))
         if was_popup:
             self.model_combo.showPopup()
+            # Qt may scroll to the current/selected row while (re)showing the
+            # popup. Restore immediately *and* once the event loop has finished
+            # laying the popup out, so whichever moment Qt scrolls we win.
+            view.verticalScrollBar().setValue(scroll)
+            QTimer.singleShot(
+                0, lambda v=view, s=scroll: v.verticalScrollBar().setValue(s)
+            )
 
     def _current_api_key(self) -> str:
         """Return the saved API key for the currently selected provider."""
