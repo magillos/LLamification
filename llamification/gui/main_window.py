@@ -897,6 +897,16 @@ class MainWindow(QMainWindow):
                 0, lambda v=view, s=scroll: v.verticalScrollBar().setValue(s)
             )
 
+    def _proxy_settings(self) -> dict:
+        """Reasoning / extra_body settings handed to the running proxy."""
+        cfg = load_config()
+        return {
+            "provider_key": self._current_provider_key(),
+            "strip_reasoning": cfg.get("strip_reasoning", False),
+            "fallback_to_reasoning": cfg.get("fallback_to_reasoning", False),
+            "model_settings": cfg.get("model_settings", {}),
+        }
+
     def _current_api_key(self) -> str:
         """Return the saved API key for the currently selected provider."""
         provider_key = self.provider_combo.currentData()
@@ -999,7 +1009,10 @@ class MainWindow(QMainWindow):
         if self._server and model_ids:
             active = self.model_combo.currentText().strip()
             if self._provider_instance:
-                self._server.configure(self._provider_instance, model_ids, active, self.allow_override_cb.isChecked())
+                self._server.configure(
+                    self._provider_instance, model_ids, active,
+                    self.allow_override_cb.isChecked(), self._proxy_settings(),
+                )
 
     @pyqtSlot()
     def _reset_refresh_btn(self):
@@ -1048,10 +1061,14 @@ class MainWindow(QMainWindow):
 
         # Create event loop and server
         self._loop = asyncio.new_event_loop()
-        self._server = ProxyServer(host="127.0.0.1", port=port)
+        debug_raw = load_config().get("debug_raw", False)
+        self._server = ProxyServer(host="127.0.0.1", port=port, debug_raw=debug_raw)
 
         models = self._models_cache if self._models_cache else [model]
-        self._server.configure(self._provider_instance, models, model, self.allow_override_cb.isChecked())
+        self._server.configure(
+            self._provider_instance, models, model,
+            self.allow_override_cb.isChecked(), self._proxy_settings(),
+        )
 
         # Auto-fetch models in the background if they haven't been fetched yet
         if not self._models_cache:
@@ -1144,6 +1161,7 @@ class MainWindow(QMainWindow):
                 self._models_cache or [model],
                 model,
                 self.allow_override_cb.isChecked(),
+                self._proxy_settings(),
             )
         # Block signals temporarily to prevent loop
         self.model_combo.blockSignals(True)
@@ -1162,7 +1180,8 @@ class MainWindow(QMainWindow):
                 self._provider_instance,
                 self._models_cache or [active],
                 active,
-                allow_override
+                allow_override,
+                self._proxy_settings(),
             )
             self.log_signal.emit(f"→ Client model override set to: {allow_override}")
 

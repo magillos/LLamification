@@ -48,6 +48,11 @@ def _parse_args(argv=None):
         action="store_true",
         help="Enable verbose debug logging (request/response payloads)",
     )
+    parser.add_argument(
+        "--debug-raw",
+        action="store_true",
+        help="Log the raw upstream response and the exact response sent to the client",
+    )
     return parser.parse_args(argv)
 
 
@@ -64,7 +69,7 @@ def main(argv=None):
     if args.gui:
         _run_gui()
     else:
-        _run_headless(verbose=args.verbose)
+        _run_headless(verbose=args.verbose, debug_raw=args.debug_raw)
 
 
 def _run_gui():
@@ -101,7 +106,7 @@ def _run_gui():
     sys.exit(app.exec())
 
 
-def _run_headless(verbose: bool = False):
+def _run_headless(verbose: bool = False, debug_raw: bool = False):
     """Run LLamification in headless mode: load config, start proxy, serve forever."""
 
     # --- Load and validate config ---
@@ -156,8 +161,19 @@ def _run_headless(verbose: bool = False):
         print(f"{_colourise('✗', _PASTEL_RED)} Failed to create provider: {e}")
         sys.exit(1)
 
-    server = ProxyServer(host="127.0.0.1", port=port, verbose=verbose)
-    server.configure(provider, [model], model, allow_override)
+    settings = {
+        "provider_key": provider_key,
+        "strip_reasoning": cfg.get("strip_reasoning", False),
+        "fallback_to_reasoning": cfg.get("fallback_to_reasoning", False),
+        "model_settings": cfg.get("model_settings", {}),
+    }
+    server = ProxyServer(
+        host="127.0.0.1",
+        port=port,
+        verbose=verbose,
+        debug_raw=debug_raw or cfg.get("debug_raw", False),
+    )
+    server.configure(provider, [model], model, allow_override, settings)
 
     logger.info(f"LLamification headless mode — provider={provider_key}, model={model}, port={port}")
     print(f"{_colourise('✓', _PASTEL_GREEN)} LLamification proxy started on {_colourise(f'127.0.0.1:{port}', _PASTEL_CYAN)}")

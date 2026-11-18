@@ -24,6 +24,11 @@ DEFAULT_CONFIG = {
     "show_tray_icon": True,
     "allow_client_override": False,
     "favourite_models": {},    # per-provider: {"custom:abc": ["model/a", ...]}
+    # Reasoning handling on /v1/chat/completions (all off by default).
+    "strip_reasoning": False,        # never forward reasoning_content to clients
+    "fallback_to_reasoning": False,  # use reasoning_content as content when content is empty
+    "debug_raw": False,              # log raw upstream and client bodies
+    "model_settings": {},            # provider_key -> {model or "*": {overrides}} (see README)
 }
 
 # Sentinel combo key for the "Add Custom Provider..." entry. It is never
@@ -193,6 +198,8 @@ def load_config() -> dict:
                 merged["custom_providers"] = {}
             if not isinstance(merged.get("favourite_models"), dict):
                 merged["favourite_models"] = {}
+            if not isinstance(merged.get("model_settings"), dict):
+                merged["model_settings"] = {}
 
             # Backfill host-derived names for any custom entry that still has a
             # placeholder display name (covers legacy entries migrated before

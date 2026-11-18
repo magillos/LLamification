@@ -12,7 +12,7 @@ config.json
 # IDE
 .vscode/
 .idea/
-
+.freebuff/
 # OS
 .DS_Store
 Thumbs.db
@@ -21,3 +21,4 @@ Thumbs.db
 *.log
 
 test_alias.py
+test_reasoning.py

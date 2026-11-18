@@ -84,6 +84,37 @@ The default port is `4001` so you can run it alongside a real Ollama server with
 
 `/v1/chat/completions` transparently passes the `tools` and `tool_choice` fields from the request to the upstream provider, and forwards any `tool_calls` in the response — both streaming and non-streaming. This means agentic clients like Cline, Continue, and Roo Code can use tools through the proxy without modification.
 
+### Reasoning output
+
+Some upstream models (llama.cpp's `llama-server` with `--reasoning-format deepseek`, DeepSeek, and others) return a `reasoning_content` field next to `content`. LLamification forwards it unchanged on `/v1/chat/completions` (non-streaming `message` and streaming `delta`), so clients that understand it keep working; clients that only read `content` are unaffected. The Ollama routes ignore it.
+
+If the model spends its whole answer budget thinking, `content` can be empty. Three optional settings in `~/.config/llamification/config.json` control this (all disabled by default):
+
+| Key | Effect |
+|-----|--------|
+| `strip_reasoning` | never forward `reasoning_content` to the client |
+| `fallback_to_reasoning` | if `content` is empty and `reasoning_content` is not, return the reasoning as `content` and log a warning |
+| `debug_raw` | log the raw upstream body and the exact response sent to the client (contains your prompts) |
+
+`strip_reasoning` and `fallback_to_reasoning` can be overridden per provider and per model in `model_settings`, and each entry may carry an `extra_body` object that is merged into the upstream request JSON. Client-supplied fields win unless their key (or dotted path) is listed in `force_extra_body`:
+
+```json
+"model_settings": {
+  "custom:cp1": {
+    "*": { "fallback_to_reasoning": true },
+    "Qwen3-4B": {
+      "extra_body": {
+        "chat_template_kwargs": { "enable_thinking": false },
+        "thinking_budget_tokens": 4096
+      },
+      "force_extra_body": ["thinking_budget_tokens"]
+    }
+  }
+}
+```
+
+Precedence is per-model entry, then the provider's `"*"` entry, then the global key. `debug_raw` can also be enabled with `python -m llamification --debug-raw`.
+
 ## Configuration
 
 All configuration is stored in `~/.config/llamification/config.json`. Use the GUI to add providers, set API keys, select models, and mark favourites. No manual editing required.

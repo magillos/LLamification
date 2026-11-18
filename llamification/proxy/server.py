@@ -1,6 +1,7 @@
 """Ollama-compatible HTTP proxy server using aiohttp."""
 
 import asyncio
+import copy
 import json
 import logging
 import uuid
@@ -21,6 +22,79 @@ from .translator import (
 )
 
 logger = logging.getLogger("llamification.proxy")
+
+_MISSING = object()
+
+
+def _get_path(source: Any, path: List[str]) -> Any:
+    """Return the value at a dotted path, or ``_MISSING`` when it is absent."""
+    current = source
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return _MISSING
+        current = current[key]
+    return current
+
+
+def _set_path(target: Dict[str, Any], path: List[str], value: Any) -> None:
+    """Set ``value`` at a dotted path, creating intermediate dicts as needed."""
+    current = target
+    for key in path[:-1]:
+        if not isinstance(current.get(key), dict):
+            current[key] = {}
+        current = current[key]
+    current[path[-1]] = value
+
+
+def _merge_prefer_client(default: Any, client: Any) -> Any:
+    """Merge an ``extra_body`` default with a client value, client leaves winning.
+
+    Nested dicts are merged so a client that overrides one sub-key still
+    inherits the other sub-keys supplied by the proxy configuration.
+    """
+    if isinstance(default, dict):
+        merged = copy.deepcopy(default)
+        if isinstance(client, dict):
+            for key, value in client.items():
+                merged[key] = _merge_prefer_client(default.get(key), value)
+        return merged
+    return copy.deepcopy(client)
+
+
+def _build_extra_body_patch(
+    extra_body: Any, force_paths: Any, client_body: Any
+) -> Optional[Dict[str, Any]]:
+    """Build the upstream payload overlay for a model's ``extra_body`` setting.
+
+    Fields the client supplied win over the configured defaults unless their
+    key (or dotted path) is listed in ``force_extra_body``.
+    """
+    if not isinstance(extra_body, dict) or not extra_body:
+        return None
+    forced = (
+        {p for p in force_paths if isinstance(p, str)}
+        if isinstance(force_paths, (list, tuple, set))
+        else set()
+    )
+    client = client_body if isinstance(client_body, dict) else {}
+    patch: Dict[str, Any] = {}
+    for key, value in extra_body.items():
+        path = key.split(".")
+        client_value = _get_path(client, path)
+        if key in forced or client_value is _MISSING:
+            _set_path(patch, path, copy.deepcopy(value))
+        else:
+            _set_path(patch, path, _merge_prefer_client(value, client_value))
+    return patch or None
+
+
+def _apply_payload_patch(payload: Dict[str, Any], patch: Dict[str, Any]) -> None:
+    """Merge ``patch`` into ``payload``, patch leaves winning."""
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(payload.get(key), dict):
+            _apply_payload_patch(payload[key], value)
+        else:
+            payload[key] = copy.deepcopy(value)
 
 
 @web.middleware
@@ -67,7 +141,13 @@ class ProxyServer:
       POST /v1/embeddings     -> embeddings (proxied to upstream)
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 11434, verbose: bool = False):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 11434,
+        verbose: bool = False,
+        debug_raw: bool = False,
+    ):
         self.host = host
         self.port = port
         self._provider: Optional[LLMProvider] = None
@@ -78,6 +158,8 @@ class ProxyServer:
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
         self._verbose: bool = verbose
+        self._debug_raw: bool = debug_raw
+        self._settings: Dict[str, Any] = {}
 
         self.app = web.Application(middlewares=[cors_middleware])
 
@@ -93,11 +175,25 @@ class ProxyServer:
         self.app.router.add_post("/v1/chat/completions", self.handle_v1_chat)
         self.app.router.add_post("/v1/embeddings", self.handle_v1_embeddings)
 
-    def configure(self, provider: LLMProvider, models: List[str], active_model: str, allow_client_override: bool = True):
+    def configure(
+        self,
+        provider: LLMProvider,
+        models: List[str],
+        active_model: str,
+        allow_client_override: bool = True,
+        settings: Optional[Dict[str, Any]] = None,
+    ):
+        """Point the server at a provider/model.
+
+        ``settings`` carries the optional reasoning / extra_body configuration
+        (``provider_key``, ``strip_reasoning``, ``fallback_to_reasoning`` and
+        ``model_settings``). Omitted settings mean everything stays off.
+        """
         self._provider = provider
         self._models = models
         self._active_model = active_model
         self._allow_client_override = allow_client_override
+        self._settings = settings or {}
         self._model_aliases = {}
         for model in models:
             if "/" in model:
@@ -140,6 +236,41 @@ class ProxyServer:
             return self._active_model
         return model
 
+    def _resolve_model_settings(self, actual_model: str, provider_model: str) -> Dict[str, Any]:
+        """Resolve reasoning / extra_body settings for one request.
+
+        Precedence: per-model entry > provider ``"*"`` entry > global keys.
+        The active provider key comes from ``settings["provider_key"]``.
+        """
+        resolved: Dict[str, Any] = {
+            "strip_reasoning": bool(self._settings.get("strip_reasoning", False)),
+            "fallback_to_reasoning": bool(self._settings.get("fallback_to_reasoning", False)),
+            "extra_body": {},
+            "force_extra_body": [],
+        }
+        overrides = self._settings.get("model_settings")
+        if not isinstance(overrides, dict):
+            return resolved
+        provider_key = self._settings.get("provider_key", "")
+        entries = overrides.get(provider_key) if provider_key else None
+        if not isinstance(entries, dict):
+            return resolved
+        # Apply the provider default first so a model entry always wins.
+        for name in ("*", provider_model, actual_model):
+            entry = entries.get(name)
+            if not isinstance(entry, dict):
+                continue
+            for key in ("strip_reasoning", "fallback_to_reasoning"):
+                if key in entry:
+                    resolved[key] = bool(entry[key])
+            if isinstance(entry.get("extra_body"), dict):
+                resolved["extra_body"] = _merge_prefer_client(
+                    resolved["extra_body"], entry["extra_body"]
+                )
+            if isinstance(entry.get("force_extra_body"), (list, tuple)):
+                resolved["force_extra_body"] = list(entry["force_extra_body"])
+        return resolved
+
     def _error_response(self, error: Exception, status: int = 502) -> web.Response:
         """Format an error as an OpenAI-style error response."""
         msg = str(error)
@@ -157,6 +288,12 @@ class ProxyServer:
             }
         }
         return web.json_response(err_body, status=status)
+
+    async def _write_sse_line(self, response: web.StreamResponse, line: str) -> None:
+        """Write one SSE line, echoing it when raw debugging is enabled."""
+        if self._debug_raw:
+            logger.info(f"[RAW CLIENT RESPONSE] {line.strip()}")
+        await response.write(line.encode("utf-8"))
 
     async def handle_root(self, request: web.Request) -> web.Response:
         return web.json_response({"status": "Ollama is running"}, status=200)
@@ -233,6 +370,15 @@ class ProxyServer:
 
         provider_model = self._provider.model_param(actual_model)
 
+        # Per-model reasoning / extra_body settings. All of these are off by
+        # default, so existing configurations behave exactly as before.
+        model_settings = self._resolve_model_settings(actual_model, provider_model)
+        strip_reasoning = model_settings["strip_reasoning"]
+        fallback_reasoning = model_settings["fallback_to_reasoning"]
+        extra_patch = _build_extra_body_patch(
+            model_settings["extra_body"], model_settings["force_extra_body"], body
+        )
+
         if stream:
             origin = request.headers.get("Origin", "*")
             response = web.StreamResponse(
@@ -248,7 +394,7 @@ class ProxyServer:
 
             # Emit initial role chunk as OpenAI does.
             role_chunk = {"choices": [{"delta": {"role": "assistant"}, "index": 0}]}
-            await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode("utf-8"))
+            await self._write_sse_line(response, f"data: {json.dumps(role_chunk)}\n\n")
 
             stream_opts = body.get("stream_options", {})
             include_usage = (
@@ -256,10 +402,54 @@ class ProxyServer:
             )
 
             try:
-                async for token, done, tool_delta, usage in self._stream_chat(
-                    provider_model, messages, options
+                # Reasoning deltas are held back only when the fallback is
+                # enabled: we must know whether real content ever arrives
+                # before deciding which field carries the reasoning text.
+                reasoning_buffer: List[str] = []
+                saw_content = False
+
+                async for token, reasoning_delta, done, tool_delta, usage in self._stream_chat(
+                    provider_model, messages, options, extra_patch
                 ):
+                    if reasoning_delta:
+                        if fallback_reasoning and not saw_content:
+                            reasoning_buffer.append(reasoning_delta)
+                        elif not strip_reasoning:
+                            chunk_data = {
+                                "choices": [
+                                    {"delta": {"reasoning_content": reasoning_delta}, "index": 0}
+                                ]
+                            }
+                            await self._write_sse_line(
+                                response, f"data: {json.dumps(chunk_data)}\n\n"
+                            )
                     if done:
+                        if reasoning_buffer:
+                            if fallback_reasoning and not saw_content:
+                                logger.warning(
+                                    "Upstream returned only reasoning for '%s'; falling back "
+                                    "to reasoning_content as content "
+                                    "(fallback_to_reasoning enabled)",
+                                    actual_model,
+                                )
+                                for piece in reasoning_buffer:
+                                    chunk_data = {
+                                        "choices": [{"delta": {"content": piece}, "index": 0}]
+                                    }
+                                    await self._write_sse_line(
+                                        response, f"data: {json.dumps(chunk_data)}\n\n"
+                                    )
+                            elif not strip_reasoning:
+                                for piece in reasoning_buffer:
+                                    chunk_data = {
+                                        "choices": [
+                                            {"delta": {"reasoning_content": piece}, "index": 0}
+                                        ]
+                                    }
+                                    await self._write_sse_line(
+                                        response, f"data: {json.dumps(chunk_data)}\n\n"
+                                    )
+                            reasoning_buffer = []
                         chunk_data = {
                             "choices": [{"delta": {}, "finish_reason": "stop", "index": 0}]
                         }
@@ -267,20 +457,34 @@ class ProxyServer:
                         chunk_data = {
                             "choices": [{"delta": {"tool_calls": [tool_delta]}, "index": 0}]
                         }
-                    else:
+                    elif token:
+                        if reasoning_buffer:
+                            if not strip_reasoning:
+                                for piece in reasoning_buffer:
+                                    held = {
+                                        "choices": [
+                                            {"delta": {"reasoning_content": piece}, "index": 0}
+                                        ]
+                                    }
+                                    await self._write_sse_line(
+                                        response, f"data: {json.dumps(held)}\n\n"
+                                    )
+                            reasoning_buffer = []
+                        saw_content = True
                         chunk_data = {
                             "choices": [{"delta": {"content": token}, "index": 0}]
                         }
-                    line = f"data: {json.dumps(chunk_data)}\n\n"
-                    await response.write(line.encode("utf-8"))
+                    else:
+                        continue
+                    await self._write_sse_line(response, f"data: {json.dumps(chunk_data)}\n\n")
                     if done:
                         if include_usage and usage:
                             usage_chunk = {"choices": [], "usage": usage}
-                            await response.write(
-                                f"data: {json.dumps(usage_chunk)}\n\n".encode("utf-8")
+                            await self._write_sse_line(
+                                response, f"data: {json.dumps(usage_chunk)}\n\n"
                             )
                         break
-                await response.write(b"data: [DONE]\n\n")
+                await self._write_sse_line(response, "data: [DONE]\n\n")
             except (ConnectionError, asyncio.CancelledError, aiohttp.ClientConnectionError) as e:
                 logger.info(f"V1 stream connection closed: {e}")
             except Exception as e:
@@ -299,19 +503,34 @@ class ProxyServer:
             return response
         else:
             try:
-                provider_resp = await self._non_stream_chat(provider_model, messages, options)
+                provider_resp = await self._non_stream_chat(
+                    provider_model, messages, options, extra_patch
+                )
                 content = ""
+                reasoning = ""
                 tool_calls = None
                 finish_reason = "stop"
                 try:
                     msg = provider_resp["choices"][0]["message"]
                     content = msg.get("content", "") or ""
+                    reasoning = msg.get("reasoning_content", "") or ""
                     tool_calls = msg.get("tool_calls")
                     if tool_calls:
                         finish_reason = "tool_calls"
                 except (KeyError, IndexError):
                     pass
                 assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
+                if reasoning and not strip_reasoning:
+                    if not content and fallback_reasoning:
+                        logger.warning(
+                            "Upstream returned only reasoning for '%s'; falling back to "
+                            "reasoning_content as content (fallback_to_reasoning enabled)",
+                            actual_model,
+                        )
+                        assistant_msg["content"] = reasoning
+                    else:
+                        # Pass the field through untouched for clients that read it.
+                        assistant_msg["reasoning_content"] = reasoning
                 if tool_calls:
                     assistant_msg["tool_calls"] = tool_calls
                 openai_resp = {
@@ -331,6 +550,8 @@ class ProxyServer:
                         {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                     ),
                 }
+                if self._debug_raw:
+                    logger.info(f"[RAW CLIENT RESPONSE] {json.dumps(openai_resp)}")
                 return web.json_response(openai_resp, status=200)
             except asyncio.TimeoutError as e:
                 logger.error("V1 chat timed out waiting for upstream response", exc_info=self._verbose)
@@ -377,7 +598,7 @@ class ProxyServer:
             response = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson", "Cache-Control": "no-cache"})
             await response.prepare(request)
             try:
-                async for token, done, _, _ in self._stream_chat(provider_model, messages, options):
+                async for token, _reasoning, done, _, _ in self._stream_chat(provider_model, messages, options):
                     chunk = make_ollama_stream_chunk(token, done)
                     await response.write(chunk.encode("utf-8"))
                     if done:
@@ -420,7 +641,7 @@ class ProxyServer:
             response = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson", "Cache-Control": "no-cache"})
             await response.prepare(request)
             try:
-                async for token, done, _, _ in self._stream_chat(provider_model, messages, options):
+                async for token, _reasoning, done, _, _ in self._stream_chat(provider_model, messages, options):
                     chunk = make_ollama_chat_stream_chunk(token, done)
                     await response.write(chunk.encode("utf-8"))
                     if done:
@@ -446,10 +667,18 @@ class ProxyServer:
                 logger.error(f"Chat error: {e}")
                 return self._error_response(e, 502)
 
-    async def _non_stream_chat(self, model: str, messages: List[Dict[str, str]], options: Dict[str, Any]) -> dict:
+    async def _non_stream_chat(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        options: Dict[str, Any],
+        payload_patch: Optional[Dict[str, Any]] = None,
+    ) -> dict:
         if not self._provider:
             raise RuntimeError("No provider configured")
         payload = self._provider.prepare_chat_payload(model, messages, False, options)
+        if payload_patch:
+            _apply_payload_patch(payload, payload_patch)
         headers = {"Content-Type": "application/json", "User-Agent": "LLamification/0.1"}
         if self._provider.api_key:
             headers["Authorization"] = f"Bearer {self._provider.api_key}"
@@ -469,15 +698,30 @@ class ProxyServer:
                     if self._verbose:
                         logger.debug(f"Upstream error {resp.status}: {err_text[:1000]}")
                     raise RuntimeError(f"Provider returned {resp.status}: {err_text}")
-                result = await resp.json()
+                raw = await resp.text()
+                if self._debug_raw:
+                    logger.info(f"[RAW UPSTREAM] {raw}")
+                try:
+                    result = json.loads(raw)
+                except json.JSONDecodeError:
+                    raise RuntimeError(f"Provider returned invalid JSON: {raw[:500]}")
                 if self._verbose:
                     logger.debug(f"Response: {json.dumps(result)[:2000]}")
                 return result
 
-    async def _stream_chat(self, model: str, messages: List[Dict[str, str]], options: Dict[str, Any]):
+    async def _stream_chat(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        options: Dict[str, Any],
+        payload_patch: Optional[Dict[str, Any]] = None,
+    ):
+        """Yield ``(content, reasoning, done, tool_delta, usage)`` from upstream."""
         if not self._provider:
             raise RuntimeError("No provider configured")
         payload = self._provider.prepare_chat_payload(model, messages, True, options)
+        if payload_patch:
+            _apply_payload_patch(payload, payload_patch)
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream", "User-Agent": "LLamification/0.1"}
         if self._provider.api_key:
             headers["Authorization"] = f"Bearer {self._provider.api_key}"
@@ -513,39 +757,44 @@ class ProxyServer:
                             continue
                         data_str = "\n".join(data_lines)
                         if data_str.strip() == "[DONE]":
-                            yield ("", True, None, None)
+                            yield ("", "", True, None, None)
                             return
                         try:
                             data = json.loads(data_str)
                         except json.JSONDecodeError:
                             logger.warning(f"Failed to parse SSE event: {data_str[:200]}")
                             continue
+                        if self._debug_raw:
+                            logger.info(f"[RAW UPSTREAM] {data_str}")
                         usage = data.get("usage")
                         choices = data.get("choices", [])
                         if choices:
                             delta = choices[0].get("delta", {}) or {}
                             content = delta.get("content", "") or ""
+                            reasoning = delta.get("reasoning_content", "") or ""
                             tool_calls = delta.get("tool_calls")
                             finish_reason = choices[0].get("finish_reason")
+                            if reasoning:
+                                yield ("", reasoning, False, None, None)
                             if content:
-                                yield (content, False, None, None)
+                                yield (content, "", False, None, None)
                             if tool_calls:
                                 for tc in tool_calls:
-                                    yield ("", False, tc, None)
+                                    yield ("", "", False, tc, None)
                             if finish_reason in ("stop", "tool_calls"):
-                                yield ("", True, None, usage)
+                                yield ("", "", True, None, usage)
                                 return
                         elif usage:
-                            yield ("", True, None, usage)
+                            yield ("", "", True, None, usage)
                             return
                 # Process a final event if the upstream closes without a trailing
                 # blank line (some llama.cpp builds do this).
                 event = buffer.replace("\r\n", "\n")
                 data_lines = [line[5:].lstrip() for line in event.split("\n") if line.startswith("data:")]
                 if data_lines and "[DONE]" in "\n".join(data_lines):
-                    yield ("", True, None, None)
+                    yield ("", "", True, None, None)
                     return
-                yield ("", True, None, None)
+                yield ("", "", True, None, None)
 
     async def start(self) -> None:
         self._runner = web.AppRunner(self.app)
