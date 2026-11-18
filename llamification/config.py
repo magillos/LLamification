@@ -89,6 +89,26 @@ def resolve_base_url(provider_key: str, config: dict) -> str:
     return ""
 
 
+def start_command_settings(provider_key: str, config: dict) -> tuple:
+    """Return ``(command, should_run, terminate_on_stop)`` for a provider.
+
+    ``should_run`` is False when the provider has no command or when the user
+    turned its "run start command" toggle off. It says nothing about whether
+    the command is currently running; callers track the process themselves.
+    """
+    info: dict = {}
+    if is_custom_provider(provider_key):
+        providers = config.get("custom_providers", {})
+        if isinstance(providers, dict):
+            entry = providers.get(custom_provider_id(provider_key))
+            if isinstance(entry, dict):
+                info = entry
+    command = (info.get("start_command") or "").strip()
+    enabled = bool(info.get("start_command_enabled", True))
+    terminate = bool(info.get("terminate_on_stop", False))
+    return command, bool(command) and enabled, terminate
+
+
 def sanitize_custom_name(name: str, existing_names) -> str:
     """Trim and de-duplicate a custom provider display name.
 
@@ -207,6 +227,14 @@ def load_config() -> dict:
             for cp_id, info in merged["custom_providers"].items():
                 if not isinstance(info, dict):
                     continue
+                # Backfill the optional start-command settings so older
+                # configs keep loading without extra guards at every use site.
+                if not isinstance(info.get("start_command"), str):
+                    info["start_command"] = ""
+                if not isinstance(info.get("start_command_enabled"), bool):
+                    info["start_command_enabled"] = True
+                if not isinstance(info.get("terminate_on_stop"), bool):
+                    info["terminate_on_stop"] = False
                 current = (info.get("name") or "").strip()
                 if current in ("", "Custom Provider", "custom"):
                     host = host_from_url(info.get("base_url", ""))

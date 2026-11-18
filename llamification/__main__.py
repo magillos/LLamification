@@ -5,7 +5,9 @@ import asyncio
 import logging
 import signal
 import sys
+from typing import Optional
 
+from .backend import READY_TIMEOUT, BackendCommand
 from .config import (
     CONFIG_FILE,
     custom_provider_id,
@@ -13,6 +15,7 @@ from .config import (
     load_config,
     provider_display_name,
     resolve_base_url,
+    start_command_settings,
 )
 from .proxy.providers import get_provider
 from .proxy.server import ProxyServer
@@ -154,6 +157,11 @@ def _run_headless(verbose: bool = False, debug_raw: bool = False):
         print(f"  Run {_colourise('python -m llamification -g', _PASTEL_YELLOW)} first to set it up.")
         sys.exit(1)
 
+    # Optional start command (llama-server, ollama serve, any other backend).
+    start_command, run_start_command, terminate_on_stop = start_command_settings(
+        provider_key, cfg
+    )
+
     # --- Create provider and server ---
     try:
         provider = get_provider(provider_key, api_key, base_url)
@@ -180,6 +188,11 @@ def _run_headless(verbose: bool = False, debug_raw: bool = False):
     print(f"  {_colourise('Provider', _PASTEL_MAGENTA)} : {_colourise(provider_display_name(provider_key, cfg), _PASTEL_CYAN)}")
     print(f"  {_colourise('Model', _PASTEL_MAGENTA)}    : {_colourise(model, _PASTEL_CYAN)}")
     print(f"  {_colourise('Override', _PASTEL_MAGENTA)} : {_colourise('allowed', _PASTEL_GREEN) if allow_override else _colourise('disabled', _PASTEL_RED)}")
+    if start_command:
+        cmd_state = "enabled" if run_start_command else "disabled"
+        print(f"  {_colourise('Start cmd', _PASTEL_MAGENTA)} : {_colourise(start_command, _PASTEL_CYAN)} ({cmd_state})")
+    else:
+        print(f"  {_colourise('Start cmd', _PASTEL_MAGENTA)} : {_colourise('(none)', _PASTEL_CYAN)}")
     print(f"  {_colourise('Press Ctrl+C to stop.', _PASTEL_YELLOW)}")
 
     # --- Run the asyncio event loop with clean shutdown ---
@@ -196,7 +209,24 @@ def _run_headless(verbose: bool = False, debug_raw: bool = False):
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _signal_handler)
 
+    backend: Optional[BackendCommand] = None
     try:
+        if run_start_command:
+            backend = BackendCommand(
+                start_command,
+                provider_name=provider_display_name(provider_key, cfg),
+                terminate_on_stop=terminate_on_stop,
+            )
+            if backend.start():
+                # Run the readiness wait inside the loop so Ctrl+C and SIGTERM
+                # still abort it immediately.
+                loop.run_until_complete(
+                    asyncio.to_thread(
+                        backend.wait_ready, base_url, READY_TIMEOUT, stop_event.is_set,
+                    )
+                )
+            else:
+                backend = None
         loop.run_until_complete(server.start())
         # Block until stop_event is set by signal handler
         loop.run_until_complete(stop_event.wait())
@@ -213,6 +243,22 @@ def _run_headless(verbose: bool = False, debug_raw: bool = False):
             loop.run_until_complete(asyncio.sleep(0.1))
         except Exception:
             pass
+        # Stop the start command according to its per-provider setting.
+        if backend is not None:
+            if backend.is_running:
+                if terminate_on_stop:
+                    backend.stop()
+                    print(f"{_colourise('✓', _PASTEL_GREEN)} Start command stopped.")
+                else:
+                    print(
+                        f"  {_colourise('Start command left running', _PASTEL_YELLOW)} "
+                        f"(pid {backend.pid}); stop it manually or enable "
+                        f"'Terminate with proxy stop'."
+                    )
+            elif backend.exit_code is not None:
+                logger.info(
+                    "Start command had already exited with code %s.", backend.exit_code
+                )
         loop.close()
         print(f"{_colourise('✓', _PASTEL_GREEN)} LLamification proxy stopped.")
 

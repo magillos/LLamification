@@ -119,6 +119,20 @@ Precedence is per-model entry, then the provider's `"*"` entry, then the global 
 
 All configuration is stored in `~/.config/llamification/config.json`. Use the GUI to add providers, set API keys, select models, and mark favourites. No manual editing required.
 
+### Start command (local backends)
+
+Each provider can define a shell command that runs before the proxy starts — useful for a local `llama-server`, `ollama serve`, or any other backend process. Both fields live in the Add/Edit Provider dialog:
+
+| Field | Config key | Default | Meaning |
+|-------|------------|---------|---------|
+| Start command | `start_command` | `""` | Shell command line run before the proxy starts |
+| Run start command before proxy | `start_command_enabled` | `true` | Main-window toggle to skip the command without deleting it |
+| Terminate with proxy stop | `terminate_on_stop` | `false` | Also stop the command (and its children) when the proxy stops |
+
+The command is executed through the shell as typed, so `llama-server -m model.gguf --port 8080`, `OLLAMA_HOST=0.0.0.0 ollama serve`, pipes and `&&` all work. Its stdout/stderr are forwarded line by line to the log (GUI log pane, or the terminal in headless mode). When the provider URL is a loopback address, the proxy waits up to 60 seconds for that host and port to accept connections before starting anyway.
+
+The command is only run when nothing from a previous start is still alive. If you stop the proxy with "Terminate with proxy stop" unchecked, the process keeps running and the next Start **reuses** it instead of launching a second one (which would normally fail to bind the port). Stop it manually — or check the box — to get a fresh one. Editing the command never restarts a live process; the log warns instead. Terminating sends `SIGTERM` to the process group (then `SIGKILL` after a few seconds), so child processes of the `sh -c` wrapper die with it.
+
 ## License
 
 MIT

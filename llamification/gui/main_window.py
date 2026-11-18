@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import threading
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from PyQt6.QtCore import (
     QEvent,
@@ -41,6 +41,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..backend import BackendCommand
 from ..config import (
     ADD_CUSTOM_KEY,
     custom_provider_id,
@@ -52,6 +53,7 @@ from ..config import (
     resolve_base_url,
     sanitize_custom_name,
     save_config,
+    start_command_settings,
 )
 from ..proxy.providers import get_provider, LLMProvider
 from ..proxy.server import ProxyServer
@@ -193,6 +195,10 @@ class MainWindow(QMainWindow):
     log_signal = pyqtSignal(str)
     models_fetched_signal = pyqtSignal(list)
     reset_refresh_signal = pyqtSignal()
+    # Server lifecycle, emitted from the server thread
+    server_status_signal = pyqtSignal(str, str)   # label text, colour
+    refresh_models_signal = pyqtSignal()
+    server_error_signal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -205,6 +211,12 @@ class MainWindow(QMainWindow):
         # Last real provider the user settled on; used to revert the combo if
         # the "Add Provider…" sentinel is cancelled.
         self._last_provider_key: str = ""
+        # Start-command processes started by this app, keyed by provider key.
+        # They live here (not on ProxyServer, which is recreated on every
+        # start) so a backend left running across a stop/start cycle is reused
+        # instead of being launched a second time.
+        self._backends: Dict[str, BackendCommand] = {}
+        self._active_backend_key: str = ""
 
         self.setWindowTitle("LLamification")
         self.setMinimumSize(600, 500)
@@ -238,6 +250,9 @@ class MainWindow(QMainWindow):
         self.log_signal.connect(self._append_log)
         self.models_fetched_signal.connect(self._populate_models)
         self.reset_refresh_signal.connect(self._reset_refresh_btn)
+        self.server_status_signal.connect(self._on_server_status)
+        self.refresh_models_signal.connect(self._on_refresh_models)
+        self.server_error_signal.connect(self._on_server_error)
 
     def _build_ui(self):
         """Construct the UI layout."""
@@ -285,6 +300,24 @@ class MainWindow(QMainWindow):
             self.remove_custom_btn,
         ]
         for w in self.custom_url_row_widgets:
+            w.setVisible(False)
+
+        # Start-command toggle: lets a provider keep its saved command but skip
+        # running it on a particular occasion. Only shown for providers that
+        # define a command.
+        self.start_cmd_cb = QCheckBox("Run start command before proxy")
+        self.start_cmd_cb.setToolTip(
+            "Run this provider's start command when the proxy starts.\n"
+            "Uncheck to skip it without deleting the command."
+        )
+        self.start_cmd_label = QLabel("")
+        self.start_cmd_label.setStyleSheet("color: #888;")
+        start_row = QHBoxLayout()
+        start_row.addWidget(self.start_cmd_cb)
+        start_row.addWidget(self.start_cmd_label, stretch=1)
+        glayout.addLayout(start_row)
+        self.start_cmd_row_widgets = [self.start_cmd_cb, self.start_cmd_label]
+        for w in self.start_cmd_row_widgets:
             w.setVisible(False)
 
         # Model row
@@ -372,6 +405,7 @@ class MainWindow(QMainWindow):
         self.edit_custom_btn.clicked.connect(self._on_edit_custom_clicked)
         # Apply inline URL edits to the running proxy only (not persisted).
         self.custom_url_edit.editingFinished.connect(self._on_custom_url_edited)
+        self.start_cmd_cb.stateChanged.connect(self._on_start_cmd_toggled)
 
     # --- Provider combo (built-ins + dynamic custom entries) ---
 
@@ -431,7 +465,54 @@ class MainWindow(QMainWindow):
         is_custom = is_custom_provider(provider_key)
         for w in self.custom_url_row_widgets:
             w.setVisible(is_custom)
+        self._refresh_start_command_ui(provider_key)
         return is_custom
+
+    def _refresh_start_command_ui(self, provider_key: str):
+        """Show the start-command toggle for providers that define a command."""
+        cfg = load_config()
+        info: dict = {}
+        if is_custom_provider(provider_key):
+            entry = cfg.get("custom_providers", {}).get(custom_provider_id(provider_key))
+            if isinstance(entry, dict):
+                info = entry
+        command = (info.get("start_command") or "").strip()
+
+        self.start_cmd_cb.blockSignals(True)
+        self.start_cmd_cb.setChecked(bool(info.get("start_command_enabled", True)))
+        self.start_cmd_cb.blockSignals(False)
+
+        if command:
+            elided = self.start_cmd_label.fontMetrics().elidedText(
+                command, Qt.TextElideMode.ElideMiddle, 380
+            )
+            self.start_cmd_label.setText(elided)
+            self.start_cmd_label.setToolTip(command)
+        else:
+            self.start_cmd_label.setText("")
+            self.start_cmd_label.setToolTip("")
+
+        for w in self.start_cmd_row_widgets:
+            w.setVisible(bool(command))
+
+    def _on_start_cmd_toggled(self, _state=None):
+        """Persist the per-provider start-command toggle.
+
+        Turning it off only stops the next proxy start from running the
+        command; a process that is already running is left alone.
+        """
+        provider_key = self._current_provider_key()
+        if not is_custom_provider(provider_key):
+            return
+        enabled = self.start_cmd_cb.isChecked()
+        cfg = load_config()
+        entry = cfg.get("custom_providers", {}).get(custom_provider_id(provider_key))
+        if not isinstance(entry, dict):
+            return
+        entry["start_command_enabled"] = enabled
+        save_config(cfg)
+        state = "enabled" if enabled else "disabled"
+        self.log_signal.emit(f"→ Start command {state} for this provider.")
 
     def _on_custom_url_edited(self):
         """Apply an inline Base URL edit to the running proxy *only*.
@@ -508,6 +589,8 @@ class MainWindow(QMainWindow):
         initial_name: str = "",
         initial_url: str = "",
         initial_key: str = "",
+        initial_command: str = "",
+        initial_terminate: bool = False,
         exclude_name: str = "",
     ) -> Optional[tuple]:
         """Open a dialog to capture a custom provider's name + base URL.
@@ -517,7 +600,8 @@ class MainWindow(QMainWindow):
         types a custom name themselves. ``initial_name`` / ``initial_url``
         pre-fill the fields (for editing). ``exclude_name`` is removed from
         ``existing_names`` before de-duplication so re-saving the same name on
-        edit does not gain a numeric suffix. Returns ``(name, base_url)`` on
+        edit does not gain a numeric suffix. Returns
+        ``(name, base_url, api_key, start_command, terminate_on_stop)`` on
         accept, or ``None`` if cancelled.
         """
         # Exclude the entry currently being edited from the uniqueness check.
@@ -525,7 +609,7 @@ class MainWindow(QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle(title)
-        dlg.setMinimumWidth(420)
+        dlg.setMinimumWidth(560)
         form = QFormLayout(dlg)
         name_edit = QLineEdit(initial_name)
         name_edit.setPlaceholderText("auto from host, or type your own")
@@ -534,9 +618,26 @@ class MainWindow(QMainWindow):
         key_edit = QLineEdit(initial_key)
         key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         key_edit.setPlaceholderText("Optional — leave blank for local/no-auth providers")
+        command_edit = QLineEdit(initial_command)
+        command_edit.setPlaceholderText(
+            "llama-server -m /path/model.gguf --port 8080 -c 4096"
+        )
+        command_edit.setToolTip(
+            "Optional shell command run before the proxy starts.\n"
+            "Its output appears in the log. A process still running from a\n"
+            "previous start is reused, not launched again."
+        )
+        terminate_cb = QCheckBox("Terminate with proxy stop")
+        terminate_cb.setChecked(initial_terminate)
+        terminate_cb.setToolTip(
+            "Stop this command (and its child processes) when the proxy stops.\n"
+            "Leave unchecked to keep the process running after the proxy stops."
+        )
         form.addRow("Name:", name_edit)
         form.addRow("Base URL:", url_edit)
         form.addRow("API Key:", key_edit)
+        form.addRow("Command to run before proxy:", command_edit)
+        form.addRow("", terminate_cb)
 
         # Track whether the user has typed a name manually. Until they do, the
         # name field mirrors the URL's host. When editing an entry that already
@@ -578,7 +679,13 @@ class MainWindow(QMainWindow):
                                 "A base URL is required for a custom provider.")
             return None
         api_key = key_edit.text().strip()
-        return name, base_url, api_key
+        return (
+            name,
+            base_url,
+            api_key,
+            command_edit.text().strip(),
+            terminate_cb.isChecked(),
+        )
 
     def _prompt_add_custom(self) -> Optional[tuple]:
         """Open a dialog to capture a new custom provider's name + base URL."""
@@ -613,12 +720,14 @@ class MainWindow(QMainWindow):
             initial_name=current_name,
             initial_url=current_url,
             initial_key=cfg.get("api_keys", {}).get(provider_key, ""),
+            initial_command=info.get("start_command", ""),
+            initial_terminate=bool(info.get("terminate_on_stop", False)),
             exclude_name=current_name,
         )
         if result is None:
             return
 
-        name, base_url, api_key = result
+        name, base_url, api_key, start_command, terminate_on_stop = result
 
         # Reload in case config changed since the dialog opened.
         cfg = load_config()
@@ -629,6 +738,8 @@ class MainWindow(QMainWindow):
             return
         cp[cp_id]["name"] = name
         cp[cp_id]["base_url"] = base_url
+        cp[cp_id]["start_command"] = start_command
+        cp[cp_id]["terminate_on_stop"] = terminate_on_stop
         # Persist the API key together with the name/base URL.
         api_keys = cfg.setdefault("api_keys", {})
         api_keys[provider_key] = api_key
@@ -642,6 +753,15 @@ class MainWindow(QMainWindow):
         if self._provider_instance:
             self._provider_instance.base_url = base_url.rstrip("/")
             self._provider_instance.api_key = api_key
+        self._refresh_start_command_ui(provider_key)
+
+        # A live process is never restarted by an edit; say so instead.
+        running = self._backends.get(provider_key)
+        if running is not None and running.is_running and running.command != start_command:
+            self.log_signal.emit(
+                f"⚠ Start command changed while pid {running.pid} is running; "
+                f"stop that process to apply the new command."
+            )
 
         self.log_signal.emit(f"✎ Updated custom provider '{name}' ({base_url}).")
 
@@ -654,7 +774,7 @@ class MainWindow(QMainWindow):
             self._refresh_custom_url_ui()
             return
 
-        name, base_url, api_key = result
+        name, base_url, api_key, start_command, terminate_on_stop = result
         if not base_url:
             QMessageBox.warning(self, "Base URL required",
                                 "A base URL is required to add a custom provider.")
@@ -670,7 +790,12 @@ class MainWindow(QMainWindow):
         cfg = load_config()
         cp = cfg.setdefault("custom_providers", {})
         cp_id = new_custom_id(cp)
-        cp[cp_id] = {"name": name, "base_url": base_url}
+        cp[cp_id] = {
+            "name": name,
+            "base_url": base_url,
+            "start_command": start_command,
+            "terminate_on_stop": terminate_on_stop,
+        }
         # Persist the API key together with the new provider.
         new_key = f"custom:{cp_id}"
         cfg.setdefault("api_keys", {})[new_key] = api_key
@@ -1070,48 +1195,66 @@ class MainWindow(QMainWindow):
             self.allow_override_cb.isChecked(), self._proxy_settings(),
         )
 
-        # Auto-fetch models in the background if they haven't been fetched yet
-        if not self._models_cache:
-            self.log_signal.emit("Auto-fetching model list in the background...")
-            threading.Thread(
-                target=self._fetch_models_thread,
-                args=(provider_key, api_key, base_url),
-                daemon=True,
-            ).start()
-
         # Save settings on start
         self._save_settings()
 
-        # Run server in a thread
+        # The start command, the readiness wait and the model auto-fetch all
+        # run inside the server thread: a local backend can spend minutes
+        # loading a model and the window must stay responsive.
+        self._active_backend_key = provider_key
+
         self._server_thread = threading.Thread(
             target=self._run_server_loop,
-            args=(self._loop, self._server),
+            args=(
+                self._loop, self._server, provider_key, base_url, port, model,
+                not self._models_cache,
+            ),
             daemon=True,
         )
         self._server_thread.start()
 
-        cfg = load_config()
-        display = provider_display_name(provider_key, cfg)
         self.start_btn.setText("■ Stop Proxy")
-        self.status_label.setText("● Running")
-        self.status_label.setStyleSheet("color: #2a2; font-weight: bold;")
-        self.log_signal.emit(f"✓ Proxy started on port {port}")
-        self.log_signal.emit(f"  Serving model '{model}' via {display}")
+        self._set_status("● Starting…", "#c8a020")
+        self.log_signal.emit("→ Starting proxy…")
         # Update tray toggle action
         if hasattr(self, "_tray_toggle_action"):
             self._tray_toggle_action.setText("Stop Proxy")
 
-    def _run_server_loop(self, loop: asyncio.AbstractEventLoop, server: ProxyServer):
-        """Run the asyncio event loop with the proxy server."""
+    def _run_server_loop(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        server: ProxyServer,
+        provider_key: str,
+        base_url: str,
+        port: int,
+        model: str,
+        needs_models: bool,
+    ):
+        """Run the asyncio event loop with the proxy server.
+
+        The provider's start command (if any) runs first, because a local
+        backend must be listening before clients — and the model list — can be
+        served. ``_server_stopping`` aborts the readiness wait promptly.
+        """
         asyncio.set_event_loop(loop)
         try:
+            self._prepare_backend(provider_key, base_url)
             loop.run_until_complete(server.start())
+            self.log_signal.emit(f"✓ Proxy started on port {port}")
+            cfg = load_config()
+            display = provider_display_name(provider_key, cfg)
+            self.log_signal.emit(f"  Serving model '{model}' via {display}")
+            self.server_status_signal.emit("● Running", "#2a2")
+            if needs_models:
+                self.log_signal.emit("Auto-fetching model list in the background...")
+                self.refresh_models_signal.emit()
             # Run until stopped — check the event periodically
             while not self._server_stopping.is_set():
                 loop.run_until_complete(asyncio.sleep(0.5))
         except Exception as e:
             logger.error(f"Server error: {e}")
             self.log_signal.emit(f"✗ Server error: {e}")
+            self.server_error_signal.emit(str(e))
         finally:
             # Cancel all pending tasks and close
             try:
@@ -1121,6 +1264,109 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             loop.close()
+
+    def _set_status(self, text: str, colour: str):
+        """Update the status label (GUI thread only)."""
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {colour}; font-weight: bold;")
+
+    @pyqtSlot(str, str)
+    def _on_server_status(self, text: str, colour: str):
+        """Apply a status update emitted by the server thread."""
+        self._set_status(text, colour)
+
+    @pyqtSlot(str)
+    def _on_server_error(self, message: str):
+        """Reset the UI and handle the start command after a server failure."""
+        if self._server is not None:
+            self._stop_server()
+
+    def _prepare_backend(self, provider_key: str, base_url: str) -> Optional[BackendCommand]:
+        """Start (or reuse) this provider's start command and wait for it.
+
+        Runs in the server thread: spawning is quick, but a local backend can
+        take minutes to load a model, so nothing here touches the GUI thread
+        directly.
+
+        A process that is still running from a previous proxy start is reused
+        rather than launched a second time — that is what lets a user stop the
+        proxy and start it again without spawning a duplicate backend (and
+        without a port clash).
+        """
+        cfg = load_config()
+        command, should_run, terminate = start_command_settings(provider_key, cfg)
+        if not command:
+            return None
+
+        existing = self._backends.get(provider_key)
+        if not should_run:
+            self.log_signal.emit("↷ Start command disabled for this provider; not run.")
+            backend = existing if (existing is not None and existing.is_running) else None
+        elif existing is not None and existing.is_running:
+            backend = existing
+            self.log_signal.emit(
+                f"↷ Start command already running (pid {existing.pid}); not running it again."
+            )
+            if existing.command != command:
+                self.log_signal.emit(
+                    f"⚠ Start command changed while pid {existing.pid} is running; "
+                    f"stop that process to apply the new command."
+                )
+        else:
+            if existing is not None and existing.exit_code is not None:
+                self.log_signal.emit(
+                    f"⚠ Start command exited earlier (code {existing.exit_code}); running it again."
+                )
+            backend = BackendCommand(
+                command,
+                provider_name=provider_display_name(provider_key, cfg),
+                terminate_on_stop=terminate,
+            )
+            if not backend.start():
+                self.log_signal.emit(
+                    "⚠ Could not run the start command; starting the proxy anyway."
+                )
+                return None
+            self._backends[provider_key] = backend
+            if self._server_stopping.is_set():
+                # Stop was clicked while the command was being spawned.
+                backend.stop()
+                self._backends.pop(provider_key, None)
+                return None
+
+        backend.terminate_on_stop = terminate
+        if backend.is_running:
+            backend.wait_ready(base_url, should_abort=self._server_stopping.is_set)
+        return backend
+
+    def _shutdown_backend(self):
+        """Stop the start command this proxy run was using, if it should be.
+
+        Idempotent; called from Stop, from a proxy start failure and from app
+        cleanup. With "terminate with proxy stop" off the process is left
+        running on purpose so the next start reuses it.
+        """
+        key = self._active_backend_key
+        self._active_backend_key = ""
+        if not key:
+            return
+        backend = self._backends.get(key)
+        if backend is None or not backend.is_running:
+            return
+        if backend.terminate_on_stop:
+            pid = backend.pid
+
+            def _terminate(cmd: BackendCommand = backend, child_pid: Optional[int] = pid):
+                cmd.stop()
+                self.log_signal.emit(f"■ Stopped start-command process (pid {child_pid}).")
+
+            # Signalling can block for a few seconds; keep the UI responsive.
+            threading.Thread(target=_terminate, daemon=True).start()
+        else:
+            self.log_signal.emit(
+                f"  Leaving start command running (pid {backend.pid}); "
+                f"it will be reused on the next start."
+            )
 
     def _stop_server(self):
         """Stop the proxy server."""
@@ -1145,9 +1391,11 @@ class MainWindow(QMainWindow):
         self._loop = None
         self._server_stopping.clear()
 
+        # Handle the start-command process this proxy run was using.
+        self._shutdown_backend()
+
         self.start_btn.setText("▶ Start Proxy")
-        self.status_label.setText("● Stopped")
-        self.status_label.setStyleSheet("color: #888; font-weight: bold;")
+        self._set_status("● Stopped", "#888")
         self.log_signal.emit("■ Proxy stopped.")
         # Update tray toggle action
         if hasattr(self, "_tray_toggle_action"):
